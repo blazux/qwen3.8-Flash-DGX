@@ -54,7 +54,14 @@ EXTRA="${EXTRA:-}"
 
 # Resolve the local snapshot directory and map it to the in-container mount.
 REPO_DIR="$HF_CACHE/hub/models--${MODEL//\//--}"
-SNAP_HOST="$(ls -d "$REPO_DIR"/snapshots/*/ 2>/dev/null | grep -v -- '-fp8hybrid' | head -1 || true)"
+# Pick the revision the cache actually points at (refs/main), not whichever snapshot
+# sorts first: a cache that holds two revisions would otherwise serve the wrong one.
+SNAP_HOST=""
+for REF in main master; do
+  REV="$(cat "$REPO_DIR/refs/$REF" 2>/dev/null || true)"
+  if [ -n "$REV" ] && [ -d "$REPO_DIR/snapshots/$REV" ]; then SNAP_HOST="$REPO_DIR/snapshots/$REV/"; break; fi
+done
+SNAP_HOST="${SNAP_HOST:-$(ls -dt "$REPO_DIR"/snapshots/*/ 2>/dev/null | grep -v -- '-fp8hybrid' | head -1 || true)}"
 if [ -z "$SNAP_HOST" ]; then
   echo "!! checkpoint not found under $REPO_DIR"
   echo "   run scripts/download-weights.sh first."
@@ -124,6 +131,15 @@ docker run -d --name "$NAME" --restart unless-stopped \
     "${OVR_ARGS[@]}" $EXTRA \
     --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 \
     "${SPEC[@]}"
+
+sleep 5
+STATE="$(docker inspect -f '{{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}}' "$NAME" 2>/dev/null || echo 'missing')"
+if [ "$STATE" != running ]; then
+  echo "!! $NAME is not running ($STATE) - last log lines:"
+  docker logs --tail 25 "$NAME" 2>&1 | sed 's/^/   /'
+  echo "   (port ${PORT} in use by another process, or the image is missing?)"
+  exit 1
+fi
 
 echo ">> $NAME starting on :$PORT (model 'qwen3.8-flash-next', mode=$MODE, ctx $CTX, yarn=$YARN, mtp=$MTP, seqs=$SEQS, prefix_cache=$PREFIX_CACHE, det_topk=$DET_TOPK, exact_topk=$EXACT_TOPK, pad_m4=$PAD_M4)"
 echo ">> first boot loads ~76 GiB of weights (~8-13 min). Follow:  docker logs -f $NAME"

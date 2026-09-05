@@ -21,7 +21,13 @@ IMAGE="${IMAGE:-qwen38-flash-dgx}"
 HF_CACHE="${HF_CACHE:-$HOME/.cache/huggingface}"
 
 REPO_DIR="$HF_CACHE/hub/models--${MODEL//\//--}"
-SNAP_HOST="$(ls -d "$REPO_DIR"/snapshots/*/ 2>/dev/null | grep -v -- '-fp8hybrid' | head -1 || true)"
+# Same revision resolution as scripts/serve.sh - the two must agree on the snapshot.
+SNAP_HOST=""
+for REF in main master; do
+  REV="$(cat "$REPO_DIR/refs/$REF" 2>/dev/null || true)"
+  if [ -n "$REV" ] && [ -d "$REPO_DIR/snapshots/$REV" ]; then SNAP_HOST="$REPO_DIR/snapshots/$REV/"; break; fi
+done
+SNAP_HOST="${SNAP_HOST:-$(ls -dt "$REPO_DIR"/snapshots/*/ 2>/dev/null | grep -v -- '-fp8hybrid' | head -1 || true)}"
 [ -n "$SNAP_HOST" ] || { echo "!! checkpoint not found under $REPO_DIR — run scripts/download-weights.sh first"; exit 1; }
 SNAP_NAME="$(basename "$SNAP_HOST")"
 DST="$REPO_DIR/snapshots/${SNAP_NAME}-fp8hybrid"

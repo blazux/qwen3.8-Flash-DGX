@@ -51,8 +51,7 @@ for fi in range(2):
 with open(os.path.join(tmp, "model.safetensors.index.json"), "w") as f:
     json.dump({"weight_map": file_of}, f)
 
-shards, dtype_str, scale_entry = m._find_shards(tmp, 1)
-cols = shards.pop("__cols__")
+shards, dtype_str, scale_entry, cols = m._find_shards(tmp, 1)
 assert dtype_str == "F8_E4M3" and cols == COLS, (dtype_str, cols)
 assert len(shards) == PARTS, len(shards)
 assert abs(float(m._read_scale(scale_entry)) - 0.03125) < 1e-9
@@ -61,6 +60,17 @@ for idx, (_p, _o, rows) in shards.items():
 
 t = m.MmapPleTable(shards, shard_size, cols, torch.float8_e4m3fn, workers=8, chunk=512)
 assert t.rows_total == ROWS
+
+# the last shard is partial: ids in [rows_total, parts*shard_size) are out of range and
+# must raise IndexError, not read past the table (both the inline and the pooled path)
+for n, kbad in ((8, 1), (5_000, 3)):
+    bad = np.random.default_rng(7).integers(0, ROWS, size=n, dtype=np.int64)
+    bad[:kbad] = ROWS + 7          # across the shard boundary: pooled multi-task path
+    try:
+        t.gather(bad)
+        raise AssertionError(f"gather accepted {n} ids with {kbad} out-of-range")
+    except IndexError:
+        pass
 
 for n in (1, 16, 5000, 131_072):
     ids = rng.integers(0, ROWS, size=n, dtype=np.int64)

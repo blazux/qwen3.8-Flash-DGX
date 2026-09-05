@@ -154,7 +154,7 @@ class MmapPleTable:
         if ids.size <= self.fast_rows:
             # Decode-sized batches: thread-pool dispatch costs more than the
             # reads themselves (~50 tasks for ~65 rows). Gather inline instead.
-            if ids.min() < 0 or ids.max() >= self.shard_size * len(self.mm):
+            if ids.min() < 0 or ids.max() >= self.rows_total:
                 raise IndexError(
                     f"PLE row id out of range: [{ids.min()}, {ids.max()}] "
                     f"for {self.rows_total} rows"
@@ -169,7 +169,7 @@ class MmapPleTable:
         # Dedupe + sort: repeated n-grams are common, and sorted rows improve
         # locality inside a shard.
         uniq, inverse = np.unique(ids, return_inverse=True)
-        if uniq[0] < 0 or uniq[-1] >= self.shard_size * len(self.mm):
+        if uniq[0] < 0 or uniq[-1] >= self.rows_total:
             raise IndexError(
                 f"PLE row id out of range: [{uniq[0]}, {uniq[-1]}] "
                 f"for {self.rows_total} rows"
@@ -282,11 +282,12 @@ class _MmapNgramEmbedding(nn.Module):
 # --------------------------------------------------------------------------- #
 def _find_shards(
     model_path: str, layer_idx: int
-) -> tuple[dict[int, tuple[str, int, int]], str | None, tuple[str, int, int] | None]:
+) -> tuple[dict[int, tuple[str, int, int]], str | None, tuple[str, int, int, str] | None, int | None]:
     """Locate ``layers.<idx>.ple.ple_embedding.ngram_embedding.shard_N.weight``.
 
-    Returns (shards, dtype_str, scale_entry) where scale_entry is
-    (path, abs_offset, nbytes) of ``ngram_embedding.weight_scale`` or None.
+    Returns (shards, dtype_str, scale_entry, cols), where scale_entry is
+    (path, abs_offset, nbytes, dtype_str) of ``ngram_embedding.weight_scale`` or
+    None, and cols is the row width shared by all shards.
     """
     shard_re = re.compile(
         rf"layers\.{layer_idx}\.ple\.ple_embedding\.ngram_embedding\.shard_(\d+)\.weight$"
@@ -310,7 +311,8 @@ def _find_shards(
 
     shards: dict[int, tuple[str, int, int]] = {}
     dtype_str: str | None = None
-    scale_entry: tuple[str, int, int] | None = None
+    scale_entry: tuple[str, int, int, str] | None = None
+    cols: int | None = None
     for path in files:
         header, data_start = parse_safetensors_header(path)
         for name, meta in header.items():
@@ -325,14 +327,10 @@ def _find_shards(
                 if end - start != rows * cols * _itemsize(dtype_str):
                     raise ValueError(f"PLE shard {name}: size/shape mismatch")
                 shards[int(m.group(1))] = (path, data_start + start, rows)
-                shard_cols = cols
             elif scale_re.search(name):
                 start, end = meta["data_offsets"]
-                scale_entry = (path, data_start + start, end - start, meta["dtype"])  # type: ignore[assignment]
-    if shards:
-        # Return cols through dtype_str consumer; keep it simple: stash on dict.
-        shards["__cols__"] = shard_cols  # type: ignore[index]
-    return shards, dtype_str, scale_entry
+                scale_entry = (path, data_start + start, end - start, meta["dtype"])
+    return shards, dtype_str, scale_entry, cols
 
 
 def _itemsize(dtype_str: str) -> int:
@@ -510,10 +508,9 @@ def apply(cls: type) -> None:
         if not m:
             raise RuntimeError(f"PLE mmap: cannot find layer index in {self._ple_mmap_prefix!r}")
         layer_idx = int(m.group(1))
-        shards, dtype_str, scale_entry = _find_shards(model_path, layer_idx)
+        shards, dtype_str, scale_entry, cols = _find_shards(model_path, layer_idx)
         if not shards:
             raise RuntimeError(f"PLE mmap: no shard tensors for layer {layer_idx} under {model_path}")
-        cols = shards.pop("__cols__")  # type: ignore[arg-type]
         if cols != self.head_dim:
             raise RuntimeError(f"PLE mmap: shard width {cols} != head_dim {self.head_dim}")
         if dtype_str not in _TABLE_DTYPES:

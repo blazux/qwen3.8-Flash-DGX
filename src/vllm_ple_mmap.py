@@ -1,6 +1,6 @@
 """vllm_ple_mmap — serve the Qwen3.8-Flash-Next N-gram (PLE) table from NVMe via mmap.
 
-Why: the 51B-parameter n-gram table is 44 GiB in FP8 and vLLM keeps it resident
+Why: the 51B-parameter n-gram table is 47.7 GiB (51.2 GB) in FP8 and vLLM keeps it resident
 (GPU, or pinned host RAM with VLLM_PLE_CPU_OFFLOAD). On a DGX Spark / GX10 the
 host and the GPU share one 121 GiB pool, so neither fits next to the 78 GiB main
 model. But a token only ever touches 16 rows x 160 bytes of that table, so the
@@ -254,7 +254,7 @@ class _MmapNgramEmbedding(nn.Module):
         table = self.table
         if table is None:
             # Weights never loaded (e.g. --load-format dummy): keep the plumbing
-            # alive with zeros so kernel tests can run without the 44 GiB table.
+            # alive with zeros so kernel tests can run without the 48 GiB table.
             return torch.zeros(
                 (*ids.shape, self.embedding_dim),
                 dtype=self._zeros_dtype,

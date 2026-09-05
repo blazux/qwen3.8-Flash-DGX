@@ -5,8 +5,8 @@ active) — on **one NVIDIA DGX Spark / ASUS GX10** with **vLLM**, at full prefi
 speed, with MTP speculative decoding, **working prefix caching**, **deterministic
 greedy decoding**, and up to **500k tokens of context**.
 
-The catch this repo solves: the NVFP4 checkpoint is **122 GiB**, which does not fit
-next to a usable KV cache in the Spark's **128 GB unified pool**. 44 GiB of that is
+The catch this repo solves: the NVFP4 checkpoint is **126 GiB**, which does not fit
+next to a usable KV cache in the Spark's **128 GB unified pool**. 48 GiB of that is
 the n-gram embedding ("PLE") table — a pure lookup that a token only touches 16 rows
 of. This repo patches the official vLLM image to **serve that table from NVMe via
 `mmap`** instead of keeping it resident. Weights drop to **~76 GiB**, the rest of the
@@ -69,7 +69,7 @@ If you cloned this before, here is the short version (details in the linked sect
   it. Numbers in [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md#hybrid-mode-nvfp4-experts--blockwise-fp8-side-layers).
 - **fp8 KV cache is available** (`KV_DTYPE=fp8_e4m3`), contributed by
   [@Nanetnounou](https://github.com/Nanetnounou): ×1.9 KV, 1M context on one box — at a
-  speed and quality cost, so it is opt-in. → [fp8 KV cache](#optional-fp8-kv-cache-1m-context)
+  speed and quality cost, so it is opt-in. → [fp8 KV cache](docs/HOW-IT-WORKS.md#fp8-kv-cache-on-the-qsa-path-opt-in)
 - `scripts/smoke-test.sh` now also checks the prefix-cache hit and determinism, and
   measures decode on a real answer instead of `ignore_eos` (which produces meaningless
   numbers with this model). `scripts/download-weights.sh` now forwards `HF_TOKEN`
@@ -99,7 +99,7 @@ full comparison tables are in [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md).*
 
 - An **NVIDIA DGX Spark or compatible GB10 (sm_121)** box, 128 GB unified memory,
   aarch64, recent NVIDIA driver, Docker with the NVIDIA container runtime.
-- **~130 GB free disk** for the checkpoint (+13 GB for the hybrid variant), on
+- ****~140 GB free disk**** for the checkpoint (+13 GB for the hybrid variant), on
   reasonably fast storage (the table is read from it at runtime — NVMe strongly
   recommended; the Spark's onboard NVMe is ideal).
 - The base image is multi-arch, so `docker build` also works on x86 Blackwell
@@ -112,7 +112,7 @@ git clone https://github.com/blazux/qwen3.8-Flash-DGX.git
 cd qwen3.8-Flash-DGX
 
 docker build -t qwen38-flash-dgx .        # ~1 min: official image + the patches
-scripts/download-weights.sh               # ~122 GiB, resumable (one-time)
+scripts/download-weights.sh               # ~126 GiB, resumable (one-time)
 scripts/serve.sh                          # NVFP4 mode, boots on :18300 (~8-13 min to load)
 docker logs -f qwen38-flash               # wait for "Application startup complete"
 scripts/smoke-test.sh                     # health, coherence, prefix-cache hit, determinism, tok/s
@@ -260,7 +260,7 @@ the patch itself defaults to on when it is unset. NVFP4 mode does not use this G
 | `SEQS` | `8` | Max concurrent sequences. **Do not benchmark with 1–2**: excess requests queue silently and aggregate tok/s flatlines (see below). |
 | `GPU_MEM` | `0.80` | Fraction of the 128 GB pool for weights+KV. `0.85` buys ~2 GiB more KV, but after a day at `0.85` the box drifted into swap, and `0.875` got OOM-killed on a 300k-token prefill with MTP. The lower you set it, the more RAM the page cache has for the 48 GiB table — which is what your prefill speed depends on (below). Right after stopping another big container the first boot can fail with "13.5 GiB KV cache is needed, larger than available" — memory not yet released; the `unless-stopped` retry succeeds. |
 | `MTP` | `2` | Speculative tokens from the model's MTP head (`0` = off). |
-| `KV_DTYPE` | `auto` | `auto` = bf16 (recommended). `fp8_e4m3` = ~1.9× KV pool, 1M context on one box, at −10% decode / −30% prefill and a measurable quality cost — see [fp8 KV cache](#optional-fp8-kv-cache-1m-context) before using it. |
+| `KV_DTYPE` | `auto` | `auto` = bf16 (recommended). `fp8_e4m3` = ~1.9× KV pool, 1M context on one box, at −10% decode / −30% prefill and a measurable quality cost — see [fp8 KV cache](docs/HOW-IT-WORKS.md#fp8-kv-cache-on-the-qsa-path-opt-in) before using it. |
 | `PREWARM` | `0` | `1` streams the 48 GiB table once at boot to warm the page cache — steadier first-request latency, ~10 s extra startup. |
 | `WORKERS` | `32` | Threads used for the mmap gather (only used above `VLLM_PLE_MMAP_FAST_ROWS`=512 unique rows; decode-sized gathers run inline). |
 | `EXTRA` | | Extra vLLM flags, passed verbatim. |
@@ -297,7 +297,7 @@ Method and harness: [load-and-waits.md](https://github.com/jschmied/qwen38-flash
 
 A token's n-gram lookup reads **16 rows × 160 bytes ≈ 2.5 KB**. Over a 20k-token
 prefill that's ~1.3 GB of small reads — under a second on NVMe, and the hot n-grams
-stay in the page cache. So the 44 GiB table never needs to be in the unified pool:
+stay in the page cache. So the 48 GiB table never needs to be in the unified pool:
 we `mmap` the checkpoint's `model-plefp8-*.safetensors` shards and gather rows on
 demand. Nothing else about the model changes — the hashing, dequant, and the sparse
 attention all run stock.

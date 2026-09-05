@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Download the NVFP4 checkpoint (~122 GiB) into the local Hugging Face cache.
+# Download the NVFP4 checkpoint (~126 GiB, 135 GB) into the local Hugging Face cache.
 # Resumable — safe to re-run if the connection drops.
 #
 #   scripts/download-weights.sh
 #
-# Needs ~130 GB free on the filesystem holding ~/.cache/huggingface.
+# Needs ~140 GB free on the filesystem holding ~/.cache/huggingface.
 set -euo pipefail
 
 MODEL="${MODEL:-RadixArk/Qwen3.8-Flash-Next-NVFP4}"

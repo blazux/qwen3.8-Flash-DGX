@@ -10,11 +10,11 @@ checkpoint breaks down roughly as:
 |---|---|---|
 | Routed experts (48 layers × 512 experts, 10 active) | NVFP4 | ~63 GiB |
 | Attention / GDN / QSA / shared experts / gate / lm_head / MTP | bf16 | ~15 GiB |
-| **N-gram (PLE) table** — 16 heads × 20M rows × 160 dims | FP8 e4m3 + 1 scale | **~44 GiB** |
-| **Total** | | **~122 GiB** |
+| **N-gram (PLE) table** — 16 heads × 20M rows × 160 dims | FP8 e4m3 + 1 scale | **~48 GiB** |
+| **Total** | | **~126 GiB** |
 
 A DGX Spark has **128 GB unified memory**, of which ~10 GiB is OS/driver/Docker. So
-122 GiB of weights leaves essentially nothing for the KV cache — you cannot serve.
+126 GiB of weights leaves essentially nothing for the KV cache — you cannot serve.
 
 vLLM ships an offload path (`VLLM_PLE_CPU_OFFLOAD=1`) that moves the table to pinned
 **host** RAM. On a discrete-GPU server that frees VRAM. On a Spark, host and device
@@ -169,7 +169,7 @@ and makes decode numbers meaningless):
    `VLLM_PLE_MMAP_FAST_ROWS`=512 unique rows) skip the thread pool. Also bf16/f16 tables,
    `VLLM_PLE_MMAP_DIR`, and a periodic `PLE mmap stats` line — which shows where the
    remaining decode cost is: ~6.5 ms of the ~9.5 ms per lookup is the disk gather
-   itself (the page cache holds only part of the 47 GiB table at `GPU_MEM=0.80`).
+   itself (the page cache holds only part of the 48 GiB table at `GPU_MEM=0.80`).
 
 ## Independent reproduction and the native offload path
 

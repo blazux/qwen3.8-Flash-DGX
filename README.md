@@ -54,8 +54,11 @@ If you cloned this before, here is the short version (details in the linked sect
   pinned by sha256 as well as by commit (and that repo is Apache-2.0 now), the fp8-KV guard only
   admits `e4m3` (the kernel launch never handled `e5m2`), `GPU_MEM` defaults to `0.80` as the
   docs already recommended, and the undocumented `VLLM_PLE_MMAP_CHUNK` and the no-auth binding
-  are in the docs. Their size corrections (the checkpoint is 126 GiB, the table 48 GiB) and
-  script fixes are landing as PRs.
+  are in the docs. Their three fixes are merged with their authorship: the measured sizes
+  (the checkpoint is 126 GiB, the table 48 GiB, plan 140 GB of disk), the PLE range guard
+  (the last shard is partial), and the scripts (snapshot resolved from `refs/main`, a start
+  check after `docker run`, the prefix-cache hit proven with `vllm:prefix_cache_hits_total`
+  instead of a stopwatch).
 - **Two checkpoint modes** — `MODE=nvfp4` (as published) or `MODE=hybrid` (NVFP4 experts
   + fp8 side layers, one-time `scripts/prepare-hybrid.sh`): **+20% decode, +8% KV,
   same quality**. Our box runs the hybrid. The fp8 side-layer conversion and the
@@ -99,7 +102,7 @@ full comparison tables are in [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md).*
 
 - An **NVIDIA DGX Spark or compatible GB10 (sm_121)** box, 128 GB unified memory,
   aarch64, recent NVIDIA driver, Docker with the NVIDIA container runtime.
-- ****~140 GB free disk**** for the checkpoint (+13 GB for the hybrid variant), on
+- **~140 GB free disk** for the checkpoint (+13 GB for the hybrid variant), on
   reasonably fast storage (the table is read from it at runtime — NVMe strongly
   recommended; the Spark's onboard NVMe is ideal).
 - The base image is multi-arch, so `docker build` also works on x86 Blackwell

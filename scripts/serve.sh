@@ -112,6 +112,8 @@ PC_ARG=--no-enable-prefix-caching
 [ "$PREFIX_CACHE" = 1 ] && PC_ARG=--enable-prefix-caching
 
 docker rm -f "$NAME" >/dev/null 2>&1 || true
+# If docker run itself fails (port already bound, ...) do not leave a Created container behind.
+trap 'rc=$?; [ $rc -ne 0 ] && docker rm -f "$NAME" >/dev/null 2>&1; exit $rc' EXIT
 # shellcheck disable=SC2086
 docker run -d --name "$NAME" --restart unless-stopped \
   --gpus all --ipc=host --shm-size 16g -p "${PORT}:8000" \
@@ -132,14 +134,20 @@ docker run -d --name "$NAME" --restart unless-stopped \
     --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 \
     "${SPEC[@]}"
 
-sleep 5
+# Fail loudly instead of printing a success line over a dead container: give vLLM a few
+# seconds to parse its arguments, then check the state (the status word only — the string
+# also carries the exit code and the OOM flag for the message).
+sleep 8
 STATE="$(docker inspect -f '{{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}}' "$NAME" 2>/dev/null || echo 'missing')"
-if [ "$STATE" != running ]; then
-  echo "!! $NAME is not running ($STATE) - last log lines:"
-  docker logs --tail 25 "$NAME" 2>&1 | sed 's/^/   /'
-  echo "   (port ${PORT} in use by another process, or the image is missing?)"
-  exit 1
-fi
+case "$STATE" in
+  running*) ;;
+  *)
+    echo "!! $NAME is not running ($STATE) - last log lines:"
+    docker logs --tail 25 "$NAME" 2>&1 | sed 's/^/   /'
+    echo "   (bad flag in EXTRA, port ${PORT} in use, or the image is missing?)"
+    exit 1
+    ;;
+esac
 
 echo ">> $NAME starting on :$PORT (model 'qwen3.8-flash-next', mode=$MODE, ctx $CTX, yarn=$YARN, mtp=$MTP, seqs=$SEQS, prefix_cache=$PREFIX_CACHE, det_topk=$DET_TOPK, exact_topk=$EXACT_TOPK, pad_m4=$PAD_M4)"
 echo ">> first boot loads ~76 GiB of weights (~8-13 min). Follow:  docker logs -f $NAME"

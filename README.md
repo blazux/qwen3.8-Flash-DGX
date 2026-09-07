@@ -42,13 +42,20 @@ If you cloned this before, here is the short version (details in the linked sect
   `torch.topk` (deterministic but −20–40% on long prefill); now replaced by
   [@jschmied](https://github.com/jschmied)'s **deterministic kernel** (vllm#55122), compiled
   into the image: identical outputs at temperature 0 **and** full prefill speed back
-  (32k: 1,794 → 2,904 tok/s). `DET_TOPK=1` is the default; `EXACT_TOPK=1` stays as a fallback.
+  (32k: 1,794 → 2,996 tok/s). `DET_TOPK=1` is the default; `EXACT_TOPK=1` stays as a fallback.
+  Kernel pin bumped 2026-09-07 (PR #10): signed-zero fix, low-shared-memory path, a launcher bug
+  that would have crashed some long-context widths, and a faster kernel.
   → [Deterministic top-k](#deterministic-top-k-det_topk1-default)
 - **Optional M%4 padding for the fp8 GEMM** (`PAD_M4=1`, hybrid mode) — the image's blockwise-fp8
   kernel is up to 10× slower on chunks whose row count is not a multiple of 4; the padding is
   [@jschmied](https://github.com/jschmied)'s. With prefix caching on (default) chunks are already
   aligned and it changes nothing, so it is off by default; with `PREFIX_CACHE=0` it is worth about
   −40% TTFT at 8k. → [M%4 padding](#optional-m4-padding-for-the-fp8-gemm-pad_m41)
+- **Why decoding stalls when other clients prefill, and the slider for it** — reported by
+  [@kutovoy](https://github.com/kutovoy) (issue #9), reproduced and measured: it is vLLM's
+  chunked prefill (one decode token per 3–7 s step while a new prompt is being prefilled), not a
+  bug. `EXTRA='--long-prefill-token-threshold 1024'` trades single-stream TTFT for
+  responsiveness; numbers and guidance in [the concurrency section](#decoding-clients-stall-while-other-clients-prefill-the-long-prefill-token-threshold-slider).
 - **Audit fixes** — [@sternnick](https://github.com/sternnick) audited the repo line by line
   against their own Spark (issue #8). Taken so far: the files fetched from @jschmied's repo are
   pinned by sha256 as well as by commit (and that repo is Apache-2.0 now), the fp8-KV guard only
@@ -209,10 +216,12 @@ Two fixes are in the image; the second is the default:
   [vllm#55122](https://github.com/vllm-project/vllm/pull/55122). The Dockerfile compiles it
   with the image's `nvcc` as a standalone extension (`_C_det.so`, ~15 s on a GX10, no vLLM
   rebuild) from his repo at a pinned commit, and an env-gated switch routes the QSA block
-  selection to it. Measured on the GX10 (hybrid, MTP=2, prefix caching): **4/4 prompts stable,
-  first-token logprobs identical to the 4th decimal**, and speed at kernel level — decode
-  32.5 tok/s, prefill 2,436 tok/s at 8k / 2,904 at 32k, needle 92k in 48 s — i.e. the same as
-  the stock non-deterministic kernel.
+  selection to it. Measured on the GX10 (hybrid, MTP=2, prefix caching) with the 2026-09-07 pin
+  (PR #10 by @jschmied: signed-zero canonicalisation, a deterministic low-shared-memory path, a
+  launcher shared-memory bug fixed, and a faster kernel — 1.0–2.4× the stock kernel's time per call
+  instead of 1.8–3.8×): **4/4 prompts stable, first-token logprobs identical to the 4th decimal**,
+  decode 31.8 tok/s, prefill 2,488 tok/s at 8k / 2,996 at 32k, needle 92k in 46 s — i.e. the same
+  as the stock non-deterministic kernel (the previous pin measured 32.5 / 2,436 / 2,904 / 48 s).
 - **`EXACT_TOPK=1` — exact `torch.topk` fallback.** Our first fix: also deterministic and same
   tournament score, but −8% prefill at 8k and −20–40% at 32k+ (decode unchanged). Kept as a
   fallback (it wins over `DET_TOPK` when set), e.g. on a GPU where the kernel is not built.
@@ -266,7 +275,7 @@ the patch itself defaults to on when it is unset. NVFP4 mode does not use this G
 | `KV_DTYPE` | `auto` | `auto` = bf16 (recommended). `fp8_e4m3` = ~1.9× KV pool, 1M context on one box, at −10% decode / −30% prefill and a measurable quality cost — see [fp8 KV cache](docs/HOW-IT-WORKS.md#fp8-kv-cache-on-the-qsa-path-opt-in) before using it. |
 | `PREWARM` | `0` | `1` streams the 48 GiB table once at boot to warm the page cache — steadier first-request latency, ~10 s extra startup. |
 | `WORKERS` | `32` | Threads used for the mmap gather (only used above `VLLM_PLE_MMAP_FAST_ROWS`=512 unique rows; decode-sized gathers run inline). |
-| `EXTRA` | | Extra vLLM flags, passed verbatim. |
+| `EXTRA` | | Extra vLLM flags, passed verbatim — e.g. `--long-prefill-token-threshold 1024` for multi-client responsiveness (see [the concurrency section](#decoding-clients-stall-while-other-clients-prefill-the-long-prefill-token-threshold-slider)), `--api-key <secret>`. |
 
 ## Throughput and concurrency
 
@@ -295,6 +304,49 @@ Two things worth knowing (their words, lightly condensed):
   quoting an aggregate number — this repo's default is now `8` for that reason.
 
 Method and harness: [load-and-waits.md](https://github.com/jschmied/qwen38-flash-next-gb10/blob/main/notes/load-and-waits.md).
+
+### Decoding clients stall while other clients prefill (the `long-prefill-token-threshold` slider)
+
+Reported by [@kutovoy](https://github.com/kutovoy) in
+[issue #9](https://github.com/blazux/qwen3.8-Flash-DGX/issues/9): with two or more agents on
+the box, a client that is decoding drops from 30 tok/s to 0.1–0.5 tok/s for a minute or two,
+then recovers. Reproduced here in minutes and it is not a bug in the recipe: vLLM runs one
+step at a time, and with chunked prefill every step that carries a prefill chunk also carries
+exactly one token for each decoding request. On this model a chunk of 8,192 tokens
+(`--max-num-batched-tokens 8192`, the default) takes ~3.5 s of compute at ~2,400 tok/s, plus
+the n-gram lookups of a prompt the page cache has never seen (0.3–0.4 s per chunk here, more
+on a box that is short on cache or swapping). So while any new prompt is being prefilled, a
+decoding client gets one token per step, i.e. one every 4–7 s. Prefix caching does not help:
+the prompts are new.
+
+The knob is `--long-prefill-token-threshold N` (per-request chunk cap; the total step budget
+stays at 8,192 for the decoders), passed through `EXTRA=`. Measured on the GX10 (hybrid,
+MTP=2, prefix caching): one client decoding, then two other clients sending cold ~72k-token
+prompts 10 s later.
+
+| `--long-prefill-token-threshold` | decoding client during the two prefills | p95 / max gap between its tokens | TTFT of each 72k prompt | single-stream prefill 8k / 32k | needle 92k |
+|---|---|---|---|---|---|
+| none (8,192 chunks, default) | **0.2 tok/s** | 5.5 s / 7.1 s | 66 s / 110 s | 2,493 / 2,994 tok/s | 46.6 s |
+| 2048 | 0.4–0.6 tok/s | 1.9 s / 3.0 s | 89 s / 89 s | not measured | — |
+| 1024 | 1.0 tok/s | 1.3 s / 2.0 s | 98 s / 98 s | 1,597 / 2,497 tok/s (−36% / −17%) | 64.8 s |
+| 512 | 1.6–1.8 tok/s | 0.85 s / 1.5 s | 112 s / 112 s | 1,268 / 2,044 tok/s (−49% / −32%) | 84.8 s |
+
+Read it as a slider, not a fix: on one GPU, keeping a decoding client at X tok/s while
+others prefill means at most ~2,400 / X prefill tokens per step, and every step below 8,192
+tokens costs single-stream prefill (a 1,024-token cap already takes 36% off an 8k TTFT). A step
+still holds one chunk of *each* running prefill, which is why 512 does not reach 5 tok/s. The
+smaller chunks do have one unambiguous benefit: peak swap-out during the prefills fell from
+90–120 MB/s to 7–60 MB/s, because the activation peak per step shrinks.
+
+- Single main user, occasional second client (our case): keep the default. Long prompts land
+  fast; the rare overlap costs the other client a slow minute.
+- Several interactive agents that must stay responsive: `EXTRA='--long-prefill-token-threshold 1024'`
+  (or `512` if TTFT matters less than never stalling), and give the page cache room —
+  `GPU_MEM=0.75`, `PREWARM=1`, keep swap small (`vm.swappiness=10`, 16 GB here; a 134 GB swap
+  file lets the kernel page vLLM itself out instead of dropping cache, and once it is swapped
+  every step page-faults). `SEQS=4` limits how many prefills can interleave.
+- The structural way out is a second Spark: the four ConnectX-7 ports exist for that, and
+  vLLM's prefill/decode disaggregation puts the prefills on the other box.
 
 ## How it fits — the one idea
 

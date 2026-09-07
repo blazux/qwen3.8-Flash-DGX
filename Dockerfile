@@ -99,7 +99,7 @@ RUN python3 /tmp/patch_qsa_fp8_kv.py ${SP} && rm /tmp/patch_qsa_fp8_kv.py
 # @jschmied's deterministic persistent_topk, upstream as vllm#55122, built here as a standalone
 # extension (_C_det.so) with the image's nvcc — no vLLM rebuild. Same determinism as patch 5's
 # exact torch.topk, but at kernel speed: on the GX10 it recovers the whole prefill penalty
-# (8k: 1,476 -> 2,436 tok/s; 32k: 1,794 -> 2,904; needle 92k: 69 s -> 48 s) with decode unchanged.
+# (8k: 1,476 -> 2,488 tok/s; 32k: 1,794 -> 2,996; needle 92k: 69 s -> 46 s) with decode unchanged.
 # Sources are fetched from https://github.com/jschmied/qwen38-flash-next-gb10 at a pinned commit
 # (Apache-2.0; attribution: @jschmied). Set DET_ARCH=120a for
 # an x86 Blackwell (RTX 5090). Inert unless VLLM_QSA_DET_TOPK=1; VLLM_QSA_EXACT_TOPK=1 still wins.

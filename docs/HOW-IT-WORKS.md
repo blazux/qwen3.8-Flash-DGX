@@ -304,6 +304,11 @@ MTP=2, prefix caching, same box, same bench script and prompts; the exact and st
 | Prefill 32k | 2,105 | 1,794 | **2,904** |
 | Needle 92k | 45 s | 69 s | **48 s** |
 
+With the 2026-09-07 pin (PR #10: signed-zero canonicalisation, deterministic low-shared-memory
+path, launcher shared-memory fix, faster kernel) the same bench gives decode 31.8 tok/s, prefill
+2,488 / 2,996 tok/s, needle 46.3 s, still 4/4 deterministic; his suite is now 210 cases and the
+previous pin fails one of them with a hard launch error at 64 rows × 40k+ columns.
+
 His standalone `test_det.py` (177 cases: bit-identical across calls, equal to an exact
 reference, adversarial tie populations around every buffer size the original kernels used)
 passes 177/177 on the GX10, and the stock op fails to reproduce itself on the same inputs.

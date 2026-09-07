@@ -101,17 +101,17 @@ RUN python3 /tmp/patch_qsa_fp8_kv.py ${SP} && rm /tmp/patch_qsa_fp8_kv.py
 # exact torch.topk, but at kernel speed: on the GX10 it recovers the whole prefill penalty
 # (8k: 1,476 -> 2,436 tok/s; 32k: 1,794 -> 2,904; needle 92k: 69 s -> 48 s) with decode unchanged.
 # Sources are fetched from https://github.com/jschmied/qwen38-flash-next-gb10 at a pinned commit
-# (Apache-2.0: LICENSE and NOTICE were added there on 2026-09-05, after this pin; attribution: @jschmied). Set DET_ARCH=120a for
+# (Apache-2.0; attribution: @jschmied). Set DET_ARCH=120a for
 # an x86 Blackwell (RTX 5090). Inert unless VLLM_QSA_DET_TOPK=1; VLLM_QSA_EXACT_TOPK=1 still wins.
-ARG KDET_SHA=20f64c4c2fd7a5c37b420fc2dd3c47aa31fdad91
+ARG KDET_SHA=e0ef69d4f5575dad00d34e05479eaf4c6547bace
 ARG KDET=https://raw.githubusercontent.com/jschmied/qwen38-flash-next-gb10/${KDET_SHA}
 ARG DET_ARCH=121a
 # Pinned by commit AND sha256 (ADD --checksum needs BuildKit, the default since Docker 23).
 ADD --checksum=sha256:138cacfc5eb117f0922d53c88727e4d0dc26dcfb246c3d401fc280cfc726cc71 ${KDET}/patches/kernel-det/build_det.py /opt/llm/kernel-det/src/build_det.py
 ADD --checksum=sha256:b103fbeaf7589b9468471142ad0b30012a076f93d20ba11fc5ff6dcb1ecd32a6 ${KDET}/patches/kernel-det/bindings_det.cpp /opt/llm/kernel-det/src/bindings_det.cpp
-ADD --checksum=sha256:00c024ce732231056dbd55454497834c5cb72c3dd50156425d6efdb4b5fe7b42 ${KDET}/patches/kernel-det/topk_det.cu /opt/llm/kernel-det/src/topk_det.cu
+ADD --checksum=sha256:19e1d53425ea9a839445722fd1dac1c41727128eebdce84508c1bfb8592afecf ${KDET}/patches/kernel-det/topk_det.cu /opt/llm/kernel-det/src/topk_det.cu
 ADD --checksum=sha256:16939700ae389750782ff5c0d5b9caef59aa0ff8b869b64ec94fa72c814910ee ${KDET}/patches/kernel-det/torch_utils.h /opt/llm/kernel-det/src/torch_utils.h
-ADD --checksum=sha256:db6f9c2b2c580ddb97b7026e01100ae23b2e2bfa5dbaa6396ba61189cc33fe6c ${KDET}/patches/kernel-det/persistent_topk.cuh /opt/llm/kernel-det/src/persistent_topk.cuh
+ADD --checksum=sha256:b4ef9ce298d43d6c0e6db9fcca451df20815b2cfe33791919c1ad9c0e84f0ba7 ${KDET}/patches/kernel-det/persistent_topk.cuh /opt/llm/kernel-det/src/persistent_topk.cuh
 ADD --checksum=sha256:70905073fe3fa361030bf1cb469b74610766bdfe361419cd7df50af2561322e3 ${KDET}/tools/determinism/qsadet_patch.py /tmp/qsadet_patch.py
 RUN cd /opt/llm/kernel-det/src && DET_BUILD_DIR=/opt/llm/kernel-det/build DET_ARCH=${DET_ARCH} python3 build_det.py 2>&1 | tail -2 \
  && cp /opt/llm/kernel-det/build/_C_det.so /opt/llm/kernel-det/_C_det.so \
@@ -126,7 +126,7 @@ RUN cd /opt/llm/kernel-det/src && DET_BUILD_DIR=/opt/llm/kernel-det/build DET_AR
 # custom op (issue #3). With --enable-prefix-caching (our default) prefill chunks are already
 # clipped to the 1,600-token Mamba block, so M % 4 == 0 and the patch is a no-op: OFF by default.
 # With PREFIX_CACHE=0 in hybrid mode it is worth about -40% TTFT at 8k. Fetched at a pinned commit
-# (Apache-2.0 since 2026-09-05, after this pin; attribution: @jschmied). NOTE: the patch itself
+# (Apache-2.0; attribution: @jschmied). NOTE: the patch itself
 # defaults to ON on sm_12x when the env var is unset, so scripts/serve.sh always sets it explicitly.
 ARG KM4_SHA=d9705bde5a5b294478a5baf82b888a64000a16ef
 ADD --checksum=sha256:deb7b7865c84ab9921e1f8e7d5c60d366910092a7888f8f570ddf5d35d83eff8 https://raw.githubusercontent.com/jschmied/qwen38-flash-next-gb10/${KM4_SHA}/tools/main/fp8_m4pad_patch.py /tmp/fp8_m4pad_patch.py

@@ -341,10 +341,13 @@ smaller chunks do have one unambiguous benefit: peak swap-out during the prefill
 - Single main user, occasional second client (our case): keep the default. Long prompts land
   fast; the rare overlap costs the other client a slow minute.
 - Several interactive agents that must stay responsive: `EXTRA='--long-prefill-token-threshold 1024'`
-  (or `512` if TTFT matters less than never stalling), and give the page cache room —
-  `GPU_MEM=0.75`, `PREWARM=1`, keep swap small (`vm.swappiness=10`, 16 GB here; a 134 GB swap
-  file lets the kernel page vLLM itself out instead of dropping cache, and once it is swapped
-  every step page-faults). `SEQS=4` limits how many prefills can interleave.
+  (or `512` if TTFT matters less than never stalling). Confirmed in the field by
+  [@techfury90](https://github.com/techfury90) with 2–6 parallel agents. Keep swap small
+  (`vm.swappiness=10` — the Spark default is 60; a 134 GB swap file lets the kernel page vLLM
+  itself out instead of dropping cache, and once it is swapped every step page-faults) and use
+  `PREWARM=1`. Lower `GPU_MEM` (0.75) only if the box is actually swapping: with several
+  long-context agents the KV pool matters more than page cache for the table. `SEQS=4` limits
+  how many prefills can interleave.
 - The structural way out is a second Spark: the four ConnectX-7 ports exist for that, and
   vLLM's prefill/decode disaggregation puts the prefills on the other box.
 

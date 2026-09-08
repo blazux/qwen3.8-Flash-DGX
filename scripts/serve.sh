@@ -4,6 +4,7 @@
 #
 #   scripts/serve.sh                          # NVFP4 checkpoint as published, 262k ctx
 #   MODE=hybrid scripts/serve.sh              # NVFP4 experts + fp8 side layers (scripts/prepare-hybrid.sh first)
+#   MODE=hybrid-mtp scripts/serve.sh          # hybrid + NVFP4 MTP draft experts (scripts/prepare-mtp-graft.sh first)
 #   YARN=1 CTX=500000 scripts/serve.sh        # 500k context via YaRN (validated)
 #   docker logs -f qwen38-flash               # wait for "Application startup complete"
 #
@@ -11,6 +12,9 @@
 #   MODE=nvfp4        nvfp4 = the checkpoint as published (side layers bf16)
 #                     hybrid = side layers in blockwise fp8: +20% decode, +15-20% KV, same
 #                     tournament score. Needs the one-time scripts/prepare-hybrid.sh
+#                     hybrid-mtp = hybrid with the MTP draft experts in NVFP4 (grafted from
+#                     Inferact's checkpoint): ~3.4 GB less on the card, ~4x fewer bytes read
+#                     per draft step. Needs scripts/prepare-mtp-graft.sh
 #   PREFIX_CACHE=1    1 = --enable-prefix-caching (correct with this image's block_size fix;
 #                     repeated prefixes — system prompts, multi-turn, tool loops — skip the prefill)
 #   DET_TOPK=1        1 = deterministic QSA top-k KERNEL (@jschmied, vllm#55122): identical output at
@@ -71,15 +75,18 @@ SNAP_NAME="$(basename "$SNAP_HOST")"
 HYBRID_ENV=()
 case "$MODE" in
   nvfp4) ;;
-  hybrid)
-    if [ ! -f "$REPO_DIR/snapshots/${SNAP_NAME}-fp8hybrid/.prepared" ]; then
-      echo "!! hybrid checkpoint not prepared: run scripts/prepare-hybrid.sh first (one-time, ~10 min)"
+  hybrid|hybrid-mtp)
+    SUFFIX="-fp8hybrid"
+    [ "$MODE" = hybrid-mtp ] && SUFFIX="-fp8hybrid-mtpnvfp4"
+    if [ ! -f "$REPO_DIR/snapshots/${SNAP_NAME}${SUFFIX}/.prepared" ]; then
+      [ "$MODE" = hybrid ] && echo "!! hybrid checkpoint not prepared: run scripts/prepare-hybrid.sh first (one-time, ~10 min)" \
+        || echo "!! hybrid-mtp checkpoint not prepared: run scripts/prepare-mtp-graft.sh first (needs prepare-hybrid.sh; one-time, ~5 min)"
       exit 1
     fi
-    SNAP_NAME="${SNAP_NAME}-fp8hybrid"
+    SNAP_NAME="${SNAP_NAME}${SUFFIX}"
     HYBRID_ENV=(-e VLLM_FP8_HYBRID=1 -e VLLM_USE_DEEP_GEMM=0)
     ;;
-  *) echo "!! MODE must be nvfp4 or hybrid"; exit 1 ;;
+  *) echo "!! MODE must be nvfp4, hybrid or hybrid-mtp"; exit 1 ;;
 esac
 SNAP_IN="/hf/hub/models--${MODEL//\//--}/snapshots/$SNAP_NAME"
 

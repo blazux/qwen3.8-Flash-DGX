@@ -359,6 +359,44 @@ The Intel AutoRound variant is fastest at raw decode but could not be made
 deterministic and has the worst cached-TTFT (its prefill is the slowest), so we did not
 adopt it; the numbers are here for completeness.
 
+### The NVFP4 MTP draft graft (`MODE=hybrid-mtp`)
+
+The hybrid keeps the checkpoint's MTP draft head as published: routed experts **fused
+BF16** (`mtp.layers.0.mlp.experts.{down_proj,gate_up_proj}`, shapes `(512,1280,2560)` and
+`(512,2560,640)`, ~4.7 GiB). The draft is read on every speculation step, so it is the
+same bandwidth story as the side layers — but it is also 3 GiB of card that spec decoding
+pays for in KV. [Inferact's](https://huggingface.co/Inferact/Qwen3.8-Flash-Next-NVFP4)
+checkpoint of the same base quantizes the draft experts per-expert NVFP4
+(6,144 tensors: `…experts.{E}.{gate_proj,up_proj,down_proj}.{weight,weight_scale,
+weight_scale_2,input_scale}`, 1.4 GiB). `scripts/prepare-mtp-graft.sh` grafts that block
+onto the `-fp8hybrid` snapshot (see the README section for the mechanics and the two
+exclude-list traps). Mechanically the swap is safe because the engine's
+`RoutedExperts.load_weights` builds its mapping with `include_fused=True` and dispatches
+per tensor on rank (3D = fused, 2D = per-expert), so both layouts load through one code
+path; the draft's quant config is resolved from the checkpoint's own `hf_quant_config.json`,
+renumbered by vLLM (`mtp.layers.0` → `mtp.layers.48` on the engine side) and matched with
+substring rules, which is why the 29 explicit module names work in both spellings.
+
+Three properties hold, all verified on the GX10:
+
+- **The target model is untouched.** Its loader skips everything under `mtp.`
+  (`skip_substrs=["mtp."]`), so the 6,144 new tensors never reach it; the fp8 dispatch
+  still detects exactly the same 300 side layers.
+- **Every emitted token is the target's argmax.** Greedy verification accepts a draft
+  token only when it matches the target's argmax, so the output text is a property of the
+  target alone. `scripts/greedy-probe.sh` against the BF16-MTP arm and the graft produces
+  byte-identical text (5/5 prompts × 400 tokens, first-token logprobs identical to 4
+  decimals) — a silently mispaired drafter would fail this.
+- **Acceptance stays in the same band** (~2.6 vs ~2.7 mean acceptance length at MTP=2):
+  the NVFP4 draft proposes marginally differently, rejected proposals cost nothing extra,
+  and the decode win comes from the ~4x smaller draft reads.
+
+Measured (same box, same defaults as the table above, MTP=2): weights 77.83 → 74.75 GiB,
+KV pool 625,669 → 734,292 tokens (+17%), greedy decode +20–27% on the 5-prompt probe.
+One caveat inherited from the graft design: the graft directory holds symlinks into *both*
+parent snapshots plus the Inferact blob — HF cache tooling cannot see that, so do not
+prune either parent.
+
 
 ### The blockwise-fp8 GEMM's `M % 4` slow path (patch 9, opt-in)
 

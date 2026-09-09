@@ -121,7 +121,8 @@ full comparison tables are in [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md).*
 
 - An **NVIDIA DGX Spark or compatible GB10 (sm_121)** box, 128 GB unified memory,
   aarch64, recent NVIDIA driver, Docker with the NVIDIA container runtime.
-- **~140 GB free disk** for the checkpoint (+13 GB for the hybrid variant), on
+- **~140 GB free disk** for the checkpoint (+13 GB for the hybrid variant, +5 GB more
+  for the NVFP4-MTP graft), on
   reasonably fast storage (the table is read from it at runtime — NVMe strongly
   recommended; the Spark's onboard NVMe is ideal).
 - The base image is multi-arch, so `docker build` also works on x86 Blackwell
@@ -189,6 +190,45 @@ MODE=hybrid YARN=1 CTX=500000 GPU_MEM=0.80 scripts/serve.sh
 
 Our own box runs the hybrid. If you want the checkpoint exactly as published, stay on
 `MODE=nvfp4` — you lose ~5 tok/s and nothing else.
+
+### NVFP4 MTP draft experts (`MODE=hybrid-mtp`)
+
+A graft on top of the hybrid: the MTP draft head's routed experts (BF16 fused, ~4.7 GiB)
+are replaced by the **NVFP4** draft experts from
+[Inferact/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/Inferact/Qwen3.8-Flash-Next-NVFP4)
+(1.4 GiB) — the combination neither parent ships: fp8 PLE table *and* a cheap draft.
+`scripts/prepare-mtp-graft.sh` builds it in ~5 min (~3.3 GB of real bytes: one shard
+rewritten without the 2 fused BF16 MTP tensors, a symlink to the donor shard, and the
+index + both quantization exclusion lists fixed — the blanket `mtp.*` globs are replaced
+by the donor's 29 explicit non-expert MTP module names in **both** `config.json` and
+`hf_quant_config.json`, or the draft loads unquantized and dies). Both parents are
+modelopt quantizations of the same base — verified by hashing `embed_tokens.weight` and
+all 29 shared draft tensors byte-for-byte before grafting. The graft reads through both
+parents (it is a directory of symlinks); don't delete either one.
+
+Measured on the GX10 (hybrid, MTP=2, greedy, real answers):
+
+| | `MODE=hybrid` | `MODE=hybrid-mtp` |
+|---|---|---|
+| Weights on card | 77.83 GiB | **74.75 GiB** (−3.1) |
+| KV cache @0.80 | 625,669 tok | **734,292 tok (+17%)** |
+| Max concurrency @262k | 2.39x | **2.80x** |
+| Decode, 5-prompt greedy probe | 26.6–33.8 tok/s | **34.7–42.5 tok/s (+20–27%)** |
+| Mean acceptance length | ~2.73 | ~2.58 (same band) |
+| Tournament quality | 45/51 | same target model, byte-identical greedy outputs (see below) |
+
+The draft swap is gated on **greedy output equivalence**: every emitted token is the
+target model's argmax (the draft only decides how many of its proposals get accepted per
+step), so `scripts/greedy-probe.sh <label>` run against both arms must produce
+byte-identical text. It does — 5/5 prompts, 400 tokens each, first-token logprobs
+identical to 4 decimals — and the faster draft is pure win: the same verification cost,
+~4x fewer bytes read per draft step. Donor revision is pinned
+(`103a7608…`, sha256 `0d44e6d7…`); a different donor revision needs re-gating.
+
+```bash
+scripts/prepare-mtp-graft.sh              # one-time, after prepare-hybrid.sh
+MODE=hybrid-mtp scripts/serve.sh
+```
 
 ## Prefix caching now works (and why it didn't)
 
@@ -479,8 +519,10 @@ src/test_qsa_exact_topk_cpu.py    CPU unit test for the exact top-k (no GPU need
 tools/fp8_convert.py              side-layer bf16 -> blockwise fp8 (by @Saren-Arterius)
 scripts/download-weights.sh
 scripts/prepare-hybrid.sh         one-time: build the -fp8hybrid snapshot
-scripts/serve.sh                  MODE=nvfp4|hybrid, PREFIX_CACHE, DET_TOPK, DRAFT_VOCAB, MADVISE, EXACT_TOPK, PAD_M4, KV_DTYPE, YARN, ...
+scripts/prepare-mtp-graft.sh      one-time: graft the NVFP4 MTP draft experts onto it (MODE=hybrid-mtp)
+scripts/serve.sh                  MODE=nvfp4|hybrid|hybrid-mtp, PREFIX_CACHE, DET_TOPK, DRAFT_VOCAB, MADVISE, EXACT_TOPK, PAD_M4, KV_DTYPE, YARN, ...
 scripts/smoke-test.sh             health, coherence, prefix-cache hit, determinism, tok/s
+scripts/greedy-probe.sh           greedy probe set; diff two arms to gate a draft/checkpoint swap
 docs/HOW-IT-WORKS.md
 ```
 
@@ -519,6 +561,9 @@ docker run --rm -v "$PWD/src:/t" -w /t --entrypoint python3 qwen38-flash-dgx tes
 
 - Model: **Qwen team, Alibaba** — Qwen3.8-Flash-Next.
 - NVFP4 checkpoint: **[RadixArk/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4)**.
+- NVFP4 MTP draft experts (the `hybrid-mtp` graft donor): **[Inferact/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/Inferact/Qwen3.8-Flash-Next-NVFP4)**; the graft recipe follows
+  [thavoc's graft write-up](https://gist.github.com/thavoc/d7083457f6f2d981f879670c34df34ab)
+  and [Peuqui/mtp-quant-transplant](https://github.com/Peuqui/mtp-quant-transplant).
 - Serving engine and base image: **vLLM** (`vllm/vllm-openai:qwen38-flash-next`,
   the `release/qwen38next` recipe / PR #53896); the Mamba state-copy race fix is
   [vllm#50729](https://github.com/vllm-project/vllm/pull/50729) by **@AndreasKaratzas**.

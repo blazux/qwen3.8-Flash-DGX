@@ -27,7 +27,7 @@ kernel that drops candidates) — and offers an optional **hybrid** checkpoint l
 
 Newest first. If you cloned this before, this is the short version; details in the linked sections.
 
-**Tonight (2026-09-08)** — the defaults are now decided by the tournament, and two new ones came out of it:
+**2026-09-08** — the defaults are now decided by an agentic/coding benchmark (called tournament), and two new ones came out of it:
 
 - **Quality is the gate for defaults now.** Every default in `scripts/serve.sh` is the setting that
   scored best on the 17-scenario agentic tournament (3 repeats); anything that only buys tok/s
@@ -63,7 +63,7 @@ Newest first. If you cloned this before, this is the short version; details in t
   that would have crashed some long-context widths, and a faster kernel.
   → [Deterministic top-k](#deterministic-top-k-det_topk1-default)
 
-**Earlier (2026-08-29 → 2026-09-07)**:
+**2026-08-29 → 2026-09-07**:
 
 - **Prefix caching works now** — `--enable-prefix-caching` was crashing, then silently
   returning wrong answers on cache hits. Root cause was a vLLM block-size bug that made

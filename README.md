@@ -18,6 +18,27 @@ on every cache hit) and **non-deterministic top-k in the sparse attention** (a G
 kernel that drops candidates) — and offers an optional **hybrid** checkpoint layout
 (NVFP4 experts + fp8 side layers) that decodes ~20% faster at the same quality.
 
+## TL;DR — run it on a DGX Spark
+
+```bash
+git clone https://github.com/blazux/qwen3.8-Flash-DGX.git && cd qwen3.8-Flash-DGX
+docker build -t qwen38-flash-dgx .            # ~1 min: official vLLM image + the 10 patches below
+scripts/download-weights.sh                   # RadixArk NVFP4 checkpoint, ~126 GiB, resumable (one-time)
+scripts/prepare-hybrid.sh                     # recommended: fp8 side layers, +20% decode, same quality (~10 min, one-time)
+MODE=hybrid YARN=1 CTX=500000 scripts/serve.sh   # the recipe our own box runs; 500k context, ~13 min to load
+docker logs -f qwen38-flash                   # ready at "Application startup complete"
+scripts/smoke-test.sh                         # health, coherence, prefix-cache hit, determinism, tok/s
+```
+
+OpenAI-compatible API on `http://localhost:18300/v1`, model name `qwen3.8-flash-next`,
+tool calling and reasoning parsers on. Every default is the setting that scored best on our
+agentic tournament (see [How the defaults are chosen](#how-the-defaults-are-chosen-quality-first-speed-as-an-option));
+what you get on a GX10: ~37 tok/s single-stream decode, ~2,500–3,000 tok/s prefill, prefix
+caching, deterministic greedy output, 500k tokens of context. Want the checkpoint exactly as
+published? Drop `prepare-hybrid.sh` and `MODE=hybrid`. Want speed over the last percent of
+quality? `MTP=3`, and `MODE=hybrid-mtp` for more KV — both explained in the [options table](#how-the-defaults-are-chosen-quality-first-speed-as-an-option).
+Everything below is the long version: what was broken on GB10, what was fixed, and the numbers.
+
 > **Independently reproduced** on a DGX Spark by
 > [@jschmied](https://github.com/jschmied) — see
 > [issue #1](https://github.com/blazux/qwen3.8-Flash-DGX/issues/1) and their
@@ -174,18 +195,8 @@ If your priority is raw throughput rather than the agent's reliability, the fast
 
 ## Quickstart
 
-```bash
-git clone https://github.com/blazux/qwen3.8-Flash-DGX.git
-cd qwen3.8-Flash-DGX
-
-docker build -t qwen38-flash-dgx .        # ~1 min: official image + the patches
-scripts/download-weights.sh               # ~126 GiB, resumable (one-time)
-scripts/serve.sh                          # NVFP4 mode, boots on :18300 (~8-13 min to load)
-docker logs -f qwen38-flash               # wait for "Application startup complete"
-scripts/smoke-test.sh                     # health, coherence, prefix-cache hit, determinism, tok/s
-```
-
-Then hit the OpenAI-compatible API:
+The commands are in the [TL;DR](#tldr--run-it-on-a-dgx-spark) at the top. Once the log says
+`Application startup complete`, hit the OpenAI-compatible API:
 
 ```bash
 curl http://localhost:18300/v1/chat/completions -H 'Content-Type: application/json' -d '{
@@ -195,11 +206,9 @@ curl http://localhost:18300/v1/chat/completions -H 'Content-Type: application/js
 }'
 ```
 
-500k context (YaRN, validated with a needle-in-a-haystack at 414k tokens):
-
-```bash
-YARN=1 CTX=500000 GPU_MEM=0.80 scripts/serve.sh
-```
+`MODE=nvfp4 scripts/serve.sh` (the default) serves the checkpoint as published at the native
+262k context; `YARN=1 CTX=500000` goes to 500k (validated with a needle-in-a-haystack at 414k
+tokens); `GPU_MEM=0.80` is the long-running-service setting, see [Tuning](#tuning-env-vars-for-scriptsservesh).
 
 ## Two checkpoint modes: NVFP4 or hybrid
 

@@ -23,47 +23,16 @@ kernel that drops candidates) — and offers an optional **hybrid** checkpoint l
 > [issue #1](https://github.com/blazux/qwen3.8-Flash-DGX/issues/1) and their
 > [write-up](https://github.com/jschmied/qwen38-flash-next-gb10).
 
-## How the defaults are chosen: quality first, speed as an option
-
-Every default in `scripts/serve.sh` is the setting that scored best on our **17-scenario
-agentic tournament** (tool loops, long-context extraction, multi-step reasoning; 3 repeats,
-temperature 0.2), run on the GX10 with one variable changed at a time, on the same day. A
-change that only buys tok/s or TTFT and costs even a point there ships as an **option**, off
-by default, with its measured cost next to it. Two runs of the same configuration differ by
-up to 2 points day to day, so anything inside that band is treated as equal and the faster
-one wins; anything below it stays an option.
-
-| what | default | measured effect (GX10, hybrid, MTP=2, prefix caching, YaRN 500k) |
-|---|---|---|
-| Hybrid checkpoint (`MODE=hybrid`) | recommended, `nvfp4` as published is the default | +20% decode, +8% KV, same tournament score |
-| Deterministic top-k kernel (`DET_TOPK=1`) | **on** | identical greedy outputs, full prefill speed, tournament neutral (44/51) |
-| Reduced draft vocabulary (`DRAFT_VOCAB=1`) | **on** | +20% decode, tournament 45/51 (the best run), outputs unchanged by construction |
-| `MADV_RANDOM` on the table (`MADVISE=random`) | **on** | cold prefill −4–8%, cleaner page cache, tournament neutral |
-| Prefix caching (`PREFIX_CACHE=1`) | **on** | ~14 s → ~1.4 s TTFT on a repeated 20k prefix |
-| `MTP=3` | option (`MTP=2` default) | +7% decode, −1 point at the tournament (44 vs 45/51) |
-| NVFP4 MTP draft experts (`MODE=hybrid-mtp`) | option | +22% KV pool, −3.9 GiB weights, decode unchanged here, tournament neutral (44/51) |
-| fp8 KV cache (`KV_DTYPE=fp8_e4m3`) | option | ×1.9 KV pool, 1M context; −10% decode, −30% prefill, one scenario lost |
-| M%4 GEMM padding (`PAD_M4=1`) | option | no-op with prefix caching on; −40% TTFT at 8k with it off |
-| Exact `torch.topk` (`EXACT_TOPK=1`) | fallback | deterministic like the kernel, −20–40% long prefill |
-| `--long-prefill-token-threshold` (via `EXTRA`) | option | keeps decoding clients responsive under concurrent prefills, at a TTFT cost |
-
-If your priority is raw throughput rather than the agent's reliability, the fast profile is
-`MODE=hybrid MTP=3` (41 tok/s in the tournament against 38.5 for the default), and
-`MODE=hybrid-mtp` on top if you need the KV pool more than the last few percent of quality.
-
 ## Update 2026-09-08 — what changed
 
-If you cloned this before, here is the short version (details in the linked sections):
+Newest first. If you cloned this before, this is the short version; details in the linked sections.
 
-- **Prefix caching works now** — `--enable-prefix-caching` was crashing, then silently
-  returning wrong answers on cache hits. Root cause was a vLLM block-size bug that made
-  every prefix hit restore an *all-zero* Mamba state; two-line fix in the image. Getting
-  there took [@Saren-Arterius](https://github.com/Saren-Arterius)'s pointer to
-  vllm#50729 and their state-copy guard, and [@0xBakeer](https://github.com/0xBakeer)'s
-  attempt to reproduce it, which sharpened the write-up.
-  `PREFIX_CACHE=1` is the new default. Repeated prefixes (system prompts, multi-turn,
-  tool loops) skip the prefill: ~14 s → ~1.4 s TTFT on a 20k-token prefix.
-  → [Prefix caching now works](#prefix-caching-now-works-and-why-it-didnt)
+**Tonight (2026-09-08)** — the defaults are now decided by the tournament, and two new ones came out of it:
+
+- **Quality is the gate for defaults now.** Every default in `scripts/serve.sh` is the setting that
+  scored best on the 17-scenario agentic tournament (3 repeats); anything that only buys tok/s
+  or TTFT is an option. MTP=3 (+7% decode, −1 point), fp8 KV, the M%4 padding and the exact
+  top-k fallback are documented options, not defaults.
 - **The MTP drafter now scores a 65,536-token vocabulary instead of 248,320** (`DRAFT_VOCAB=1`,
   default): the target verifies every drafted token, so outputs are unchanged; the draft step
   reads 320 MiB of head instead of 1.27 GiB. Measured with the tournament, one variable at a
@@ -72,10 +41,17 @@ If you cloned this before, here is the short version (details in the linked sect
   reimplemented here (their code is AGPL). Same source for the `MADV_RANDOM` advice on the
   mmapped table, now on by default (no readahead: cold prefill −4–8%, cleaner page cache, a
   slightly larger KV pool). → [Reduced draft vocabulary](#reduced-draft-vocabulary-draft_vocab1-default)
-- **Quality is the gate for defaults now.** Every default in `scripts/serve.sh` is the setting that
-  scored best on the 17-scenario agentic tournament (3 repeats); anything that only buys tok/s
-  or TTFT is an option. MTP=3 (+7% decode, −1 point), fp8 KV, the M%4 padding and the exact
-  top-k fallback are documented options, not defaults.
+- **`MODE=hybrid-mtp`** — [@pfy](https://github.com/pfy)'s graft of Inferact's NVFP4 MTP draft
+  experts onto the hybrid checkpoint (PR #11): −3.9 GiB of weights, **+22% KV pool**. On our box
+  decode is unchanged (the cheaper draft is accepted less often) and the tournament is neutral
+  (44/51), so it ships as an option for people who need context or concurrency more than the
+  last percent of quality. → [NVFP4 MTP draft experts](#nvfp4-mtp-draft-experts-modehybrid-mtp)
+- Full same-day comparison behind those choices (all hybrid, MTP=2, prefix caching, YaRN 500k):
+  exact `torch.topk` 43/51 @31.4 tok/s → deterministic kernel 44/51 @31.9 → `MADV_RANDOM` 44.5/51 @33.5 →
+  **reduced draft vocabulary 45/51 @38.5 (default)** → same with MTP=3 44/51 @41.2 (option) → `hybrid-mtp` 44/51 @33.0, KV +22% (option).
+
+**2026-09-07** — kernel pin bump and multi-client guidance:
+
 - **Greedy decoding is deterministic now — at no prefill cost.** The GB10 sparse-attention
   top-k kernel was non-deterministic and dropped candidates, diagnosed and reported upstream by
   [@k3dani](https://github.com/k3dani) (issue #3, vllm#51782). First fixed with an exact
@@ -86,6 +62,18 @@ If you cloned this before, here is the short version (details in the linked sect
   Kernel pin bumped 2026-09-07 (PR #10): signed-zero fix, low-shared-memory path, a launcher bug
   that would have crashed some long-context widths, and a faster kernel.
   → [Deterministic top-k](#deterministic-top-k-det_topk1-default)
+
+**Earlier (2026-08-29 → 2026-09-07)**:
+
+- **Prefix caching works now** — `--enable-prefix-caching` was crashing, then silently
+  returning wrong answers on cache hits. Root cause was a vLLM block-size bug that made
+  every prefix hit restore an *all-zero* Mamba state; two-line fix in the image. Getting
+  there took [@Saren-Arterius](https://github.com/Saren-Arterius)'s pointer to
+  vllm#50729 and their state-copy guard, and [@0xBakeer](https://github.com/0xBakeer)'s
+  attempt to reproduce it, which sharpened the write-up.
+  `PREFIX_CACHE=1` is the new default. Repeated prefixes (system prompts, multi-turn,
+  tool loops) skip the prefill: ~14 s → ~1.4 s TTFT on a 20k-token prefix.
+  → [Prefix caching now works](#prefix-caching-now-works-and-why-it-didnt)
 - **Optional M%4 padding for the fp8 GEMM** (`PAD_M4=1`, hybrid mode) — the image's blockwise-fp8
   kernel is up to 10× slower on chunks whose row count is not a multiple of 4; the padding is
   [@jschmied](https://github.com/jschmied)'s. With prefix caching on (default) chunks are already
@@ -106,11 +94,6 @@ If you cloned this before, here is the short version (details in the linked sect
   (the last shard is partial), and the scripts (snapshot resolved from `refs/main`, a start
   check after `docker run`, the prefix-cache hit proven with `vllm:prefix_cache_hits_total`
   instead of a stopwatch).
-- **`MODE=hybrid-mtp`** — [@pfy](https://github.com/pfy)'s graft of Inferact's NVFP4 MTP draft
-  experts onto the hybrid checkpoint (PR #11): −3.9 GiB of weights, **+22% KV pool**. On our box
-  decode is unchanged (the cheaper draft is accepted less often) and the tournament is neutral
-  (44/51), so it ships as an option for people who need context or concurrency more than the
-  last percent of quality. → [NVFP4 MTP draft experts](#nvfp4-mtp-draft-experts-modehybrid-mtp)
 - **Two checkpoint modes** — `MODE=nvfp4` (as published) or `MODE=hybrid` (NVFP4 experts
   + fp8 side layers, one-time `scripts/prepare-hybrid.sh`): **+20% decode, +8% KV,
   same quality**. Our box runs the hybrid. The fp8 side-layer conversion and the
@@ -149,6 +132,34 @@ prefix-caching work; nothing here is extrapolated.
 full comparison tables are in [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md).*
 
 ---
+
+## How the defaults are chosen: quality first, speed as an option
+
+Every default in `scripts/serve.sh` is the setting that scored best on our **17-scenario
+agentic tournament** (tool loops, long-context extraction, multi-step reasoning; 3 repeats,
+temperature 0.2), run on the GX10 with one variable changed at a time, on the same day. A
+change that only buys tok/s or TTFT and costs even a point there ships as an **option**, off
+by default, with its measured cost next to it. Two runs of the same configuration differ by
+up to 2 points day to day, so anything inside that band is treated as equal and the faster
+one wins; anything below it stays an option.
+
+| what | default | measured effect (GX10, hybrid, MTP=2, prefix caching, YaRN 500k) |
+|---|---|---|
+| Hybrid checkpoint (`MODE=hybrid`) | recommended, `nvfp4` as published is the default | +20% decode, +8% KV, same tournament score |
+| Deterministic top-k kernel (`DET_TOPK=1`) | **on** | identical greedy outputs, full prefill speed, tournament neutral (44/51) |
+| Reduced draft vocabulary (`DRAFT_VOCAB=1`) | **on** | +20% decode, tournament 45/51 (the best run), outputs unchanged by construction |
+| `MADV_RANDOM` on the table (`MADVISE=random`) | **on** | cold prefill −4–8%, cleaner page cache, tournament neutral |
+| Prefix caching (`PREFIX_CACHE=1`) | **on** | ~14 s → ~1.4 s TTFT on a repeated 20k prefix |
+| `MTP=3` | option (`MTP=2` default) | +7% decode, −1 point at the tournament (44 vs 45/51) |
+| NVFP4 MTP draft experts (`MODE=hybrid-mtp`) | option | +22% KV pool, −3.9 GiB weights, decode unchanged here, tournament neutral (44/51) |
+| fp8 KV cache (`KV_DTYPE=fp8_e4m3`) | option | ×1.9 KV pool, 1M context; −10% decode, −30% prefill, one scenario lost |
+| M%4 GEMM padding (`PAD_M4=1`) | option | no-op with prefix caching on; −40% TTFT at 8k with it off |
+| Exact `torch.topk` (`EXACT_TOPK=1`) | fallback | deterministic like the kernel, −20–40% long prefill |
+| `--long-prefill-token-threshold` (via `EXTRA`) | option | keeps decoding clients responsive under concurrent prefills, at a TTFT cost |
+
+If your priority is raw throughput rather than the agent's reliability, the fast profile is
+`MODE=hybrid MTP=3` (41 tok/s in the tournament against 38.5 for the default), and
+`MODE=hybrid-mtp` on top if you need the KV pool more than the last few percent of quality.
 
 ## Requirements
 

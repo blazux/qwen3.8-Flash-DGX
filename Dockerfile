@@ -13,6 +13,7 @@
 #   7. fp8_e4m3 KV cache on the QSA path              (--kv-cache-dtype fp8_e4m3)
 #   8. Deterministic persistent_topk kernel           (VLLM_QSA_DET_TOPK=1) — replaces 5 at no prefill cost
 #   9. M%4 padding for the blockwise-fp8 GEMM         (VLLM_FP8_PAD_M4=1)   — hybrid mode with prefix caching OFF
+#  10. Reduced draft vocabulary for the MTP drafter    (VLLM_MTP_DRAFT_VOCAB=<ids.npy>) — +20% decode, same tournament score
 #
 #   docker build -t qwen38-flash-dgx .
 #
@@ -132,3 +133,17 @@ ARG KM4_SHA=d9705bde5a5b294478a5baf82b888a64000a16ef
 ADD --checksum=sha256:deb7b7865c84ab9921e1f8e7d5c60d366910092a7888f8f570ddf5d35d83eff8 https://raw.githubusercontent.com/jschmied/qwen38-flash-next-gb10/${KM4_SHA}/tools/main/fp8_m4pad_patch.py /tmp/fp8_m4pad_patch.py
 RUN python3 /tmp/fp8_m4pad_patch.py && rm /tmp/fp8_m4pad_patch.py \
  && python3 -c "import ast; p='${SP}/vllm/model_executor/kernels/linear/scaled_mm/cutlass.py'; s=open(p).read(); ast.parse(s); assert 'fp8m4pad::scaled_mm_padded' in s; print('fp8 m4pad wired OK')"
+
+# --- 10. Reduced draft vocabulary for the MTP drafter (VLLM_MTP_DRAFT_VOCAB, opt-in per env) ----
+# vLLM shares the target's lm_head with the MTP draft, so every draft step scores all 248,320
+# vocabulary rows (a 1.27 GiB bf16 read per drafted token) on a bandwidth-bound decode step.
+# With VLLM_MTP_DRAFT_VOCAB=<ids.npy> the draft scores a private 65,536-row slice of the head
+# (+320 MiB) and every other id gets -inf; the target still verifies every token, so outputs are
+# unchanged and only the acceptance rate can move. Measured on the GX10 (hybrid, MTP=2): decode
+# 33.1 -> 36.6-38.5 tok/s, acceptance 75 -> 68%, tournament 45/51 (same as without). The id set
+# = the 65,536 most frequent tokens (corpus + BPE order) plus every special/added token; rebuild
+# it for another language mix with tools/build_draft_vocab.py. Idea from MiaAI-Lab's recipe
+# (independent reimplementation). scripts/serve.sh enables it by default (DRAFT_VOCAB=1).
+COPY src/patch_mtp_draft_vocab.py /tmp/patch_mtp_draft_vocab.py
+COPY src/draft_vocab_65536.npy /opt/llm/draft_vocab_65536.npy
+RUN python3 /tmp/patch_mtp_draft_vocab.py ${SP}/vllm/models/qwen3_8_flash_next/nvidia/mtp.py && rm /tmp/patch_mtp_draft_vocab.py

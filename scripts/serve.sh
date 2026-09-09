@@ -18,6 +18,9 @@
 #   EXACT_TOPK=0      1 = exact torch.topk fallback (also deterministic, but -20-40% long prefill); wins over DET_TOPK
 #   PAD_M4=0          1 = pad M%4 in the blockwise-fp8 GEMM (@jschmied). Hybrid mode only; a no-op with
 #                     PREFIX_CACHE=1 (chunks are 1600-aligned), about -40% TTFT at 8k with PREFIX_CACHE=0
+#   DRAFT_VOCAB=1     1 = the MTP drafter scores only the 65,536 most frequent tokens (+20% decode, same
+#                     tournament score); 0 = full vocabulary; a path = your own ids.npy (tools/build_draft_vocab.py)
+#   MADVISE=random    madvise on the mmapped PLE table: random (default; no readahead, cleaner page cache) or normal
 #   PORT=18300        host port for the API
 #   CTX=262144        max context length (native). With YARN=1 up to ~500000 (see README)
 #   YARN=0            1 = YaRN rope scaling (factor 4) for CTX > 262144
@@ -42,6 +45,8 @@ PREFIX_CACHE="${PREFIX_CACHE:-1}"
 DET_TOPK="${DET_TOPK:-1}"
 EXACT_TOPK="${EXACT_TOPK:-0}"
 PAD_M4="${PAD_M4:-0}"
+DRAFT_VOCAB="${DRAFT_VOCAB:-1}"
+MADVISE="${MADVISE:-random}"
 PORT="${PORT:-18300}"
 CTX="${CTX:-262144}"
 YARN="${YARN:-0}"
@@ -108,6 +113,12 @@ if [ "$MTP" != 0 ]; then
 fi
 
 DETENV=(); [ "$DET_TOPK" = 1 ] && DETENV=(-e VLLM_QSA_DET_TOPK=1 -e VLLM_QSA_DET_LIB=/opt/llm/kernel-det/_C_det.so)
+case "$DRAFT_VOCAB" in
+  0|"") ;;
+  1) DETENV+=(-e VLLM_MTP_DRAFT_VOCAB=/opt/llm/draft_vocab_65536.npy) ;;
+  *) DETENV+=(-e VLLM_MTP_DRAFT_VOCAB="$DRAFT_VOCAB") ;;
+esac
+DETENV+=(-e VLLM_PLE_MMAP_MADVISE="$MADVISE")
 PC_ARG=--no-enable-prefix-caching
 [ "$PREFIX_CACHE" = 1 ] && PC_ARG=--enable-prefix-caching
 
@@ -149,6 +160,6 @@ case "$STATE" in
     ;;
 esac
 
-echo ">> $NAME starting on :$PORT (model 'qwen3.8-flash-next', mode=$MODE, ctx $CTX, yarn=$YARN, mtp=$MTP, seqs=$SEQS, prefix_cache=$PREFIX_CACHE, det_topk=$DET_TOPK, exact_topk=$EXACT_TOPK, pad_m4=$PAD_M4)"
+echo ">> $NAME starting on :$PORT (model 'qwen3.8-flash-next', mode=$MODE, ctx $CTX, yarn=$YARN, mtp=$MTP, seqs=$SEQS, prefix_cache=$PREFIX_CACHE, det_topk=$DET_TOPK, exact_topk=$EXACT_TOPK, pad_m4=$PAD_M4, draft_vocab=$DRAFT_VOCAB, madvise=$MADVISE)"
 echo ">> first boot loads ~76 GiB of weights (~8-13 min). Follow:  docker logs -f $NAME"
 echo ">> ready when the log says 'Application startup complete'. Then: scripts/smoke-test.sh"

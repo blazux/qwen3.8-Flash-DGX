@@ -23,7 +23,7 @@ kernel that drops candidates) — and offers an optional **hybrid** checkpoint l
 > [issue #1](https://github.com/blazux/qwen3.8-Flash-DGX/issues/1) and their
 > [write-up](https://github.com/jschmied/qwen38-flash-next-gb10).
 
-## Update 2026-09-04 — what changed
+## Update 2026-09-08 — what changed
 
 If you cloned this before, here is the short version (details in the linked sections):
 
@@ -36,6 +36,18 @@ If you cloned this before, here is the short version (details in the linked sect
   `PREFIX_CACHE=1` is the new default. Repeated prefixes (system prompts, multi-turn,
   tool loops) skip the prefill: ~14 s → ~1.4 s TTFT on a 20k-token prefix.
   → [Prefix caching now works](#prefix-caching-now-works-and-why-it-didnt)
+- **The MTP drafter now scores a 65,536-token vocabulary instead of 248,320** (`DRAFT_VOCAB=1`,
+  default): the target verifies every drafted token, so outputs are unchanged; the draft step
+  reads 320 MiB of head instead of 1.27 GiB. Measured with the tournament, one variable at a
+  time on the same day: **45/51, the best score of any configuration we ran, at 38.5 tok/s
+  (+23%)**. Idea taken from [MiaAI-Lab's recipe](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark),
+  reimplemented here (their code is AGPL). Same source for the `MADV_RANDOM` advice on the
+  mmapped table, now on by default (no readahead: cold prefill −4–8%, cleaner page cache, a
+  slightly larger KV pool). → [Reduced draft vocabulary](#reduced-draft-vocabulary-draft_vocab1-default)
+- **Quality is the gate for defaults now.** Every default in `scripts/serve.sh` is the setting that
+  scored best on the 17-scenario agentic tournament (3 repeats); anything that only buys tok/s
+  or TTFT is an option. MTP=3 (+7% decode, −1 point), fp8 KV, the M%4 padding and the exact
+  top-k fallback are documented options, not defaults.
 - **Greedy decoding is deterministic now — at no prefill cost.** The GB10 sparse-attention
   top-k kernel was non-deterministic and dropped candidates, diagnosed and reported upstream by
   [@k3dani](https://github.com/k3dani) (issue #3, vllm#51782). First fixed with an exact
@@ -92,7 +104,7 @@ prefix-caching work; nothing here is extrapolated.
 | | llama.cpp IQ4_XS | **NVFP4 (this repo)** | **hybrid (this repo)** |
 |---|---|---|---|
 | Prefill | ~540 tok/s | **~2,400–2,900 tok/s** (deterministic kernel; warm page cache — a first pass over a cold region of the table reads from NVMe and can be 2–3× slower, see `PREWARM`) | same |
-| Decode, single stream | ~22 tok/s (no MTP) | **~26 tok/s** with MTP=2 | **~31 tok/s** |
+| Decode, single stream | ~22 tok/s (no MTP) | **~26 tok/s** with MTP=2 | **~37 tok/s** (reduced draft vocabulary; ~31 without) |
 | Prefix-cache hit, TTFT on a 20k-token prefix | n/a | **~1.4 s** (vs ~14 s cold) | same |
 | Context | 262k | **262k native, 500k with YaRN** | same |
 | KV cache @0.80 (500k YaRN, MTP) | — | ~580k tokens | ~630k tokens |
@@ -257,6 +269,39 @@ chunks:
 `PAD_M4=1` also sets `VLLM_FP8_PAD_M4=1`; `scripts/serve.sh` always passes the variable because
 the patch itself defaults to on when it is unset. NVFP4 mode does not use this GEMM.
 
+## Reduced draft vocabulary (`DRAFT_VOCAB=1`, default)
+
+vLLM shares the target model's `lm_head` with the MTP draft, so every draft step scores all
+248,320 vocabulary rows: a 1.27 GiB bf16 read per drafted token, on a decode step that is
+memory-bandwidth bound. With `DRAFT_VOCAB=1` the drafter scores a private 65,536-row slice of
+the head (+320 MiB of memory) and every other token gets −∞, so the proposer's argmax/sampling
+code is untouched. The target still verifies every drafted token: **outputs are identical to
+full-vocabulary drafting**; only the acceptance rate can move, down, when the target wants a
+token outside the set (about 6% of the tokens of a French text, 75% → 68% acceptance here).
+
+The 65,536 ids are the most frequent tokens of a small local corpus, then BPE merge order as a
+frequency proxy, plus every special and added token (chat template, tool-call and thinking
+markers, byte fallbacks). `tools/build_draft_vocab.py` rebuilds the set for another language
+mix; `DRAFT_VOCAB=/path/ids.npy` uses your own, `DRAFT_VOCAB=0` disables.
+
+Measured on the GX10 the way defaults are decided here — the 17-scenario agentic tournament,
+3 repeats, temperature 0.2, one variable per run, all on the same day (hybrid, MTP=2, prefix
+caching, YaRN 500k):
+
+| configuration | tournament | tok/s in the tournament |
+|---|---|---|
+| hybrid, exact `torch.topk` (the previous default) | 43/51 (84.3%) | 31.4 |
+| + deterministic kernel (PR #10) | 44/51 (86.3%) | 31.9 |
+| + `MADV_RANDOM` on the table | 44.5/51 (87.3%) | 33.5 |
+| **+ reduced draft vocabulary, MTP=2 (the new default)** | **45/51 (88.2%)** | **38.5** |
+| same, MTP=3 | 44/51 (86.3%) | 41.2 |
+
+Two runs of the same configuration on different days differ by up to 2 points, so the four
+first rows are equivalent in quality; the last one shows why MTP=3 stays an option. Single-stream
+`bench` numbers for the default: decode 36.6 tok/s, prefill 2,473 tok/s at 8k / 3,004 at 32k,
+needle 92k in 45.5 s, 4/4 deterministic. The KV pool loses the 320 MiB slice plus the
+full-width logits buffer the patch rebuilds per draft step (about 60k tokens at `GPU_MEM=0.80`).
+
 ## Tuning (env vars for `scripts/serve.sh`)
 
 | Var | Default | Notes |
@@ -265,6 +310,8 @@ the patch itself defaults to on when it is unset. NVFP4 mode does not use this G
 | `PREFIX_CACHE` | `1` | `--enable-prefix-caching`. Correct with this image (block_size fix). |
 | `DET_TOPK` | `1` | Deterministic QSA top-k **kernel** (vllm#55122): identical outputs at T=0 at full kernel speed. `0` = stock kernel (non-deterministic, may drop attention candidates, issue #3). |
 | `EXACT_TOPK` | `0` | `1` = exact `torch.topk` fallback (deterministic; −8% prefill at 8k, −20–40% at 32k+). Wins over `DET_TOPK` when set. |
+| `DRAFT_VOCAB` | `1` | MTP drafter scores only the 65,536 most frequent tokens (+20% decode, same tournament score, outputs unchanged). `0` = full vocabulary; a path = your own ids (`tools/build_draft_vocab.py`). |
+| `MADVISE` | `random` | `madvise` on the mmapped PLE table: `random` (no readahead: cold prefill −4–8%, cleaner page cache) or `normal`. |
 | `PAD_M4` | `0` | `1` = pad M%4 in the blockwise-fp8 GEMM (hybrid mode). No-op with `PREFIX_CACHE=1`; about −40% TTFT at 8k with `PREFIX_CACHE=0`. |
 | `PORT` | `18300` | API port |
 | `CTX` | `262144` | Max context. Native is 262144; with `YARN=1` up to `500000` is validated. |
@@ -423,6 +470,8 @@ src/patch_qsa_exact_topk.py       5. exact, deterministic QSA top-k             
                                      from @jschmied's repo (pinned commit) — vllm#55122
 (Dockerfile patch 9)              9. M%4 padding for the blockwise-fp8 GEMM (@jschmied,      VLLM_FP8_PAD_M4=1
                                      pinned commit) — hybrid mode with prefix caching off
+src/patch_mtp_draft_vocab.py     10. reduced draft vocabulary for the MTP drafter          VLLM_MTP_DRAFT_VOCAB=<ids.npy>
+src/draft_vocab_65536.npy            the default 65,536-id set (tools/build_draft_vocab.py rebuilds it)
 src/vllm_fp8_hybrid_modelopt.py   6. NVFP4 experts + fp8 side layers dispatch        VLLM_FP8_HYBRID=1
 src/patch_qsa_fp8_kv.py           7. fp8_e4m3 KV cache on the QSA path (by @Nanetnounou) --kv-cache-dtype fp8_e4m3
 src/test_ple_mmap_cpu.py          CPU unit test for the gather (no GPU needed)
@@ -430,7 +479,7 @@ src/test_qsa_exact_topk_cpu.py    CPU unit test for the exact top-k (no GPU need
 tools/fp8_convert.py              side-layer bf16 -> blockwise fp8 (by @Saren-Arterius)
 scripts/download-weights.sh
 scripts/prepare-hybrid.sh         one-time: build the -fp8hybrid snapshot
-scripts/serve.sh                  MODE=nvfp4|hybrid, PREFIX_CACHE, DET_TOPK, EXACT_TOPK, PAD_M4, KV_DTYPE, YARN, ...
+scripts/serve.sh                  MODE=nvfp4|hybrid, PREFIX_CACHE, DET_TOPK, DRAFT_VOCAB, MADVISE, EXACT_TOPK, PAD_M4, KV_DTYPE, YARN, ...
 scripts/smoke-test.sh             health, coherence, prefix-cache hit, determinism, tok/s
 docs/HOW-IT-WORKS.md
 ```
@@ -462,6 +511,11 @@ docker run --rm -v "$PWD/src:/t" -w /t --entrypoint python3 qwen38-flash-dgx tes
   MAU/revenue clause) — review it before production use.
 
 ## Credits
+
+- The two ideas behind the reduced draft vocabulary and the `MADV_RANDOM` table advice come
+  from **[MiaAI-Lab](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark)**'s
+  recipe for their own checkpoint; both are reimplemented here from scratch (their code is
+  AGPL-3.0) and measured on this checkpoint.
 
 - Model: **Qwen team, Alibaba** — Qwen3.8-Flash-Next.
 - NVFP4 checkpoint: **[RadixArk/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4)**.

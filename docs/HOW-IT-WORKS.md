@@ -313,6 +313,38 @@ His standalone `test_det.py` (177 cases: bit-identical across calls, equal to an
 reference, adversarial tie populations around every buffer size the original kernels used)
 passes 177/177 on the GX10, and the stock op fails to reproduce itself on the same inputs.
 
+## The MTP drafter's vocabulary, and `MADV_RANDOM` on the table
+
+Two changes taken as ideas from MiaAI-Lab's recipe and reimplemented here.
+
+**Reduced draft vocabulary.** `llm_base_proposer._maybe_share_lm_head` gives the MTP draft the
+target's `lm_head`, so each draft step is a (B × 2560) · (2560 × 248,320) bf16 GEMV: 1.27 GiB
+read per drafted token, twice per step at MTP=2, on a decode step that is bandwidth-bound.
+`src/patch_mtp_draft_vocab.py` wraps `Qwen3_8FlashNextMTP.compute_logits`: on first call it
+slices the shared head to the ids in `VLLM_MTP_DRAFT_VOCAB` (a private 65,536 × 2560 copy,
+320 MiB), then each call computes the reduced logits and scatters them into a full-width tensor
+filled with −∞, so `argmax`, the rejection sampler and `VocabMapping` see the usual shape. The
+target's head is never touched. Correctness argument: with greedy drafting the rejection sampler
+accepts a drafted token with probability p_target(token) and otherwise resamples from the target
+with that token removed, which reproduces the target distribution exactly for *any* draft; a
+smaller vocabulary only changes which token is drafted. The tournament confirmed it (45/51, the
+best run), and acceptance moved 75% → 68%.
+
+The id set: tokens of a local corpus by frequency, then the lowest ids (Qwen's BPE vocabulary is
+in merge order, a frequency proxy), plus all special/added tokens and the 256 byte fallbacks —
+`tools/build_draft_vocab.py`. On a French document 6.6% of tokens sit above the 65,536 cut, which
+is the acceptance loss you should expect on prose in a language the corpus does not cover; a
+98,304-id set recovers part of it for 160 MiB more per step (not separable from 65,536 in our
+6-run bench).
+
+**`MADV_RANDOM`.** Row lookups are 160-byte reads at hashed addresses. Without the advice the
+kernel's mmap readahead pulls a window of pages around every faulting row and fills the page
+cache with neighbours that are never used. `np.memmap` exposes the underlying `mmap`, and one
+`madvise(MADV_RANDOM)` per shard (`VmFlags: rr` in `/proc/<pid>/smaps`) makes a cold row cost one
+page. Measured: cold 8k prefill 3.41–4.37 s → 3.26–3.33 s, 32k 13.7–14.6 s → 13.2 s, and the KV
+pool grew by ~28k tokens because less cache was resident when vLLM profiled memory. `PREWARM`
+reads the file through a separate descriptor and is unaffected.
+
 ## Hybrid mode: NVFP4 experts + blockwise-fp8 side layers
 
 The RadixArk checkpoint quantizes only the routed experts (ModelOpt NVFP4) and leaves

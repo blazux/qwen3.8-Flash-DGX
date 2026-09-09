@@ -34,6 +34,7 @@ Knobs (env):
   VLLM_PLE_MMAP=1            enable
   VLLM_PLE_MMAP_WORKERS=32   gather threads (page faults overlap across threads)
   VLLM_PLE_MMAP_CHUNK=2048   rows per gather task
+  VLLM_PLE_MMAP_MADVISE=random  madvise on the shard mmaps: random (default, no readahead) or normal
   VLLM_PLE_MMAP_PREWARM=0    1 = stream the whole table once at load to fill the
                              page cache with whatever memory is free (harmless,
                              evictable; ~10 s at 4.7 GB/s)
@@ -78,6 +79,23 @@ _TABLE_DTYPES = {
 
 def enabled() -> bool:
     return os.environ.get(ENV_ENABLE, "0").lower() in ("1", "true", "yes")
+
+
+def _madvise(mm: np.memmap, kind: str) -> None:
+    """Best-effort madvise on the mmap behind a np.memmap (Linux, Python >= 3.8)."""
+    try:
+        import mmap as _mmap
+
+        flag = {"random": _mmap.MADV_RANDOM, "normal": _mmap.MADV_NORMAL}[kind]
+        raw = getattr(mm, "_mmap", None)
+        if raw is not None:
+            raw.madvise(flag)
+            _MADVISED.append(kind)
+    except Exception as exc:  # pragma: no cover - platform dependent
+        logger.warning("PLE mmap: madvise(%s) failed: %s", kind, exc)
+
+
+_MADVISED: list[str] = []
 
 
 def _env_int(name: str, default: int) -> int:
@@ -126,11 +144,19 @@ class MmapPleTable:
         self.paths: list[str | None] = [None] * (max(shards) + 1)
         self.mm: list[np.memmap | None] = [None] * (max(shards) + 1)
         self.rows_total = 0
+        advise = os.environ.get("VLLM_PLE_MMAP_MADVISE", "random").strip().lower()
         for idx, (path, offset, rows) in shards.items():
             self.paths[idx] = path
             self.mm[idx] = np.memmap(
                 path, dtype=np.uint8, mode="r", offset=offset, shape=(rows, row_bytes)
             )
+            # Row lookups are 160-byte reads at hashed (random) addresses. Without
+            # MADV_RANDOM the kernel's mmap readahead pulls a window of pages around
+            # every faulting row and fills the page cache with neighbours that are
+            # never used; with it a cold row costs one page. PREWARM reads the file
+            # through a separate descriptor, so it is not affected.
+            if advise in ("random", "1"):
+                _madvise(self.mm[idx], "random")
             self.rows_total += rows
         self.pool = ThreadPoolExecutor(max_workers=max(1, int(workers)))
         self.fast_rows = _env_int("VLLM_PLE_MMAP_FAST_ROWS", 512)

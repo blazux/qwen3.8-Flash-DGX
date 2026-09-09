@@ -25,6 +25,8 @@
 #   DRAFT_VOCAB=1     1 = the MTP drafter scores only the 65,536 most frequent tokens (+20% decode, same
 #                     tournament score); 0 = full vocabulary; a path = your own ids.npy (tools/build_draft_vocab.py)
 #   MADVISE=random    madvise on the mmapped PLE table: random (default; no readahead, cleaner page cache) or normal
+#   LOG_REQUESTS=0    1 = log every prompt and output (VLLM_LOGGING_LEVEL=DEBUG, --enable-log-requests
+#                     --enable-log-outputs) for tools/vllm_watch.py. Debugging only: privacy + unbounded logs
 #   PORT=18300        host port for the API
 #   CTX=262144        max context length (native). With YARN=1 up to ~500000 (see README)
 #   YARN=0            1 = YaRN rope scaling (factor 4) for CTX > 262144
@@ -51,6 +53,7 @@ EXACT_TOPK="${EXACT_TOPK:-0}"
 PAD_M4="${PAD_M4:-0}"
 DRAFT_VOCAB="${DRAFT_VOCAB:-1}"
 MADVISE="${MADVISE:-random}"
+LOG_REQUESTS="${LOG_REQUESTS:-0}"
 PORT="${PORT:-18300}"
 CTX="${CTX:-262144}"
 YARN="${YARN:-0}"
@@ -126,6 +129,7 @@ case "$DRAFT_VOCAB" in
   *) DETENV+=(-e VLLM_MTP_DRAFT_VOCAB="$DRAFT_VOCAB") ;;
 esac
 DETENV+=(-e VLLM_PLE_MMAP_MADVISE="$MADVISE")
+LOGARGS=(); [ "$LOG_REQUESTS" = 1 ] && { DETENV+=(-e VLLM_LOGGING_LEVEL=DEBUG); LOGARGS=(--enable-log-requests --enable-log-outputs); }
 PC_ARG=--no-enable-prefix-caching
 [ "$PREFIX_CACHE" = 1 ] && PC_ARG=--enable-prefix-caching
 
@@ -148,7 +152,7 @@ docker run -d --name "$NAME" --restart unless-stopped \
     $CC \
     --no-enable-flashinfer-autotune \
     --kv-cache-dtype "$KV_DTYPE" \
-    "${OVR_ARGS[@]}" $EXTRA \
+    "${OVR_ARGS[@]}" "${LOGARGS[@]}" $EXTRA \
     --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 \
     "${SPEC[@]}"
 

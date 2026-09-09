@@ -23,6 +23,34 @@ kernel that drops candidates) — and offers an optional **hybrid** checkpoint l
 > [issue #1](https://github.com/blazux/qwen3.8-Flash-DGX/issues/1) and their
 > [write-up](https://github.com/jschmied/qwen38-flash-next-gb10).
 
+## How the defaults are chosen: quality first, speed as an option
+
+Every default in `scripts/serve.sh` is the setting that scored best on our **17-scenario
+agentic tournament** (tool loops, long-context extraction, multi-step reasoning; 3 repeats,
+temperature 0.2), run on the GX10 with one variable changed at a time, on the same day. A
+change that only buys tok/s or TTFT and costs even a point there ships as an **option**, off
+by default, with its measured cost next to it. Two runs of the same configuration differ by
+up to 2 points day to day, so anything inside that band is treated as equal and the faster
+one wins; anything below it stays an option.
+
+| what | default | measured effect (GX10, hybrid, MTP=2, prefix caching, YaRN 500k) |
+|---|---|---|
+| Hybrid checkpoint (`MODE=hybrid`) | recommended, `nvfp4` as published is the default | +20% decode, +8% KV, same tournament score |
+| Deterministic top-k kernel (`DET_TOPK=1`) | **on** | identical greedy outputs, full prefill speed, tournament neutral (44/51) |
+| Reduced draft vocabulary (`DRAFT_VOCAB=1`) | **on** | +20% decode, tournament 45/51 (the best run), outputs unchanged by construction |
+| `MADV_RANDOM` on the table (`MADVISE=random`) | **on** | cold prefill −4–8%, cleaner page cache, tournament neutral |
+| Prefix caching (`PREFIX_CACHE=1`) | **on** | ~14 s → ~1.4 s TTFT on a repeated 20k prefix |
+| `MTP=3` | option (`MTP=2` default) | +7% decode, −1 point at the tournament (44 vs 45/51) |
+| NVFP4 MTP draft experts (`MODE=hybrid-mtp`) | option | +22% KV pool, −3.9 GiB weights, decode unchanged here, tournament neutral (44/51) |
+| fp8 KV cache (`KV_DTYPE=fp8_e4m3`) | option | ×1.9 KV pool, 1M context; −10% decode, −30% prefill, one scenario lost |
+| M%4 GEMM padding (`PAD_M4=1`) | option | no-op with prefix caching on; −40% TTFT at 8k with it off |
+| Exact `torch.topk` (`EXACT_TOPK=1`) | fallback | deterministic like the kernel, −20–40% long prefill |
+| `--long-prefill-token-threshold` (via `EXTRA`) | option | keeps decoding clients responsive under concurrent prefills, at a TTFT cost |
+
+If your priority is raw throughput rather than the agent's reliability, the fast profile is
+`MODE=hybrid MTP=3` (41 tok/s in the tournament against 38.5 for the default), and
+`MODE=hybrid-mtp` on top if you need the KV pool more than the last few percent of quality.
+
 ## Update 2026-09-08 — what changed
 
 If you cloned this before, here is the short version (details in the linked sections):
@@ -78,6 +106,11 @@ If you cloned this before, here is the short version (details in the linked sect
   (the last shard is partial), and the scripts (snapshot resolved from `refs/main`, a start
   check after `docker run`, the prefix-cache hit proven with `vllm:prefix_cache_hits_total`
   instead of a stopwatch).
+- **`MODE=hybrid-mtp`** — [@pfy](https://github.com/pfy)'s graft of Inferact's NVFP4 MTP draft
+  experts onto the hybrid checkpoint (PR #11): −3.9 GiB of weights, **+22% KV pool**. On our box
+  decode is unchanged (the cheaper draft is accepted less often) and the tournament is neutral
+  (44/51), so it ships as an option for people who need context or concurrency more than the
+  last percent of quality. → [NVFP4 MTP draft experts](#nvfp4-mtp-draft-experts-modehybrid-mtp)
 - **Two checkpoint modes** — `MODE=nvfp4` (as published) or `MODE=hybrid` (NVFP4 experts
   + fp8 side layers, one-time `scripts/prepare-hybrid.sh`): **+20% decode, +8% KV,
   same quality**. Our box runs the hybrid. The fp8 side-layer conversion and the
@@ -217,13 +250,32 @@ Measured on the GX10 (hybrid, MTP=2, greedy, real answers):
 | Mean acceptance length | ~2.73 | ~2.58 (same band) |
 | Tournament quality | 45/51 | same target model, byte-identical greedy outputs (see below) |
 
+Those are the author's numbers. Ours, measured the way defaults are decided here (same
+box, same day as the table in [Reduced draft vocabulary](#reduced-draft-vocabulary-draft_vocab1-default),
+full-vocabulary draft on both arms):
+
+| | `MODE=hybrid` | `MODE=hybrid-mtp` |
+|---|---|---|
+| Tournament (17 scenarios × 3) | 44.5/51 | **44/51** (same failures, within the day's noise) |
+| tok/s in the tournament | 33.5 | 33.0 |
+| Decode, single stream (bench) | 33.1 tok/s | 32.6 tok/s |
+| MTP acceptance | 75% (mean length 2.50) | 63.5% (2.27) |
+| KV pool @0.80, YaRN 500k | 626k tok | **764k tok (+22%)** |
+| Weights on card | 77.8 GiB | **73.9 GiB** |
+| Deterministic 4/4, smoke-test (cache hit + logprobs) | yes | yes |
+
+So on this box the graft is a **memory** win, not a speed win: the NVFP4 drafter reads ~4×
+fewer bytes per draft step but its proposals are accepted less often, and the two cancel.
+It is quality-neutral, which is why it ships as an option rather than the default; take it
+when the KV pool or concurrency matters more than the last percent. Not yet measured in
+combination with the reduced draft vocabulary.
+
 The draft swap is gated on **greedy output equivalence**: every emitted token is the
 target model's argmax (the draft only decides how many of its proposals get accepted per
 step), so `scripts/greedy-probe.sh <label>` run against both arms must produce
 byte-identical text. It does — 5/5 prompts, 400 tokens each, first-token logprobs
-identical to 4 decimals — and the faster draft is pure win: the same verification cost,
-~4x fewer bytes read per draft step. Donor revision is pinned
-(`103a7608…`, sha256 `0d44e6d7…`); a different donor revision needs re-gating.
+identical to 4 decimals. Donor revision is pinned (`103a7608…`, sha256 `0d44e6d7…`); a
+different donor revision needs re-gating.
 
 ```bash
 scripts/prepare-mtp-graft.sh              # one-time, after prepare-hybrid.sh
@@ -358,7 +410,7 @@ full-width logits buffer the patch rebuilds per draft step (about 60k tokens at 
 | `YARN` | `0` | `1` = YaRN rope scaling (factor 4, Qwen's recipe) for `CTX` > 262144. |
 | `SEQS` | `8` | Max concurrent sequences. **Do not benchmark with 1–2**: excess requests queue silently and aggregate tok/s flatlines (see below). |
 | `GPU_MEM` | `0.80` | Fraction of the 128 GB pool for weights+KV. `0.85` buys ~2 GiB more KV, but after a day at `0.85` the box drifted into swap, and `0.875` got OOM-killed on a 300k-token prefill with MTP. The lower you set it, the more RAM the page cache has for the 48 GiB table — which is what your prefill speed depends on (below). Right after stopping another big container the first boot can fail with "13.5 GiB KV cache is needed, larger than available" — memory not yet released; the `unless-stopped` retry succeeds. |
-| `MTP` | `2` | Speculative tokens from the model's MTP head (`0` = off). |
+| `MTP` | `2` | Speculative tokens from the model's MTP head (`0` = off). `3` is +7% decode but cost a point at the tournament (44 vs 45/51), so it stays an option. |
 | `KV_DTYPE` | `auto` | `auto` = bf16 (recommended). `fp8_e4m3` = ~1.9× KV pool, 1M context on one box, at −10% decode / −30% prefill and a measurable quality cost — see [fp8 KV cache](docs/HOW-IT-WORKS.md#fp8-kv-cache-on-the-qsa-path-opt-in) before using it. |
 | `PREWARM` | `0` | `1` streams the 48 GiB table once at boot to warm the page cache — steadier first-request latency, ~10 s extra startup. |
 | `WORKERS` | `32` | Threads used for the mmap gather (only used above `VLLM_PLE_MMAP_FAST_ROWS`=512 unique rows; decode-sized gathers run inline). |

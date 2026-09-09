@@ -81,6 +81,7 @@ def read_header(path):
 # --- 1. the donor blob: download once, pinned revision + sha256 ------------
 os.makedirs(f"{DONOR}/blobs", exist_ok=True)
 os.makedirs(f"{DONOR}/snapshots/{DONOR_REV}", exist_ok=True)
+os.makedirs(f"{DONOR}/refs", exist_ok=True)  # fresh cache: the refs dir does not exist yet (@techfury90)
 open(f"{DONOR}/refs/main", "w").write(DONOR_REV)
 if not os.path.exists(DONOR_BLOB):
     url = f"https://huggingface.co/Inferact/Qwen3.8-Flash-Next-NVFP4/resolve/{DONOR_REV}/{DONOR_SHARD}"

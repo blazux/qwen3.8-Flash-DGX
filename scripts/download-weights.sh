@@ -9,11 +9,12 @@
 #   MAX_WORKERS=24 scripts/download-weights.sh     # more parallel connections
 #   XET=1 scripts/download-weights.sh              # Xet backend (see the caution below)
 #
-# EXCLUDE takes space-separated globs and skips those files. Its use is a
-# compressed-tensors checkpoint whose BF16 PLE table you intend to replace with a
-# donor's FP8 one (see scripts/prepare-ct.sh): that table is one ~102 GB shard, so
-# skipping it turns a 183 GB download into 81 GB. Verify the donor first with
-# tools/verify_ple_donor.py, which needs no download at all.
+# EXCLUDE takes space-separated globs and skips those files -- for a checkpoint
+# where you already have an equivalent copy of one large shard, or do not intend to
+# serve it. On some checkpoints the PLE n-gram table alone is a ~102 GB shard, so
+# skipping one file can halve the download. Only skip a shard you can account for:
+# the index still names it, so whatever consumes the checkpoint has to be told
+# where those tensors live instead.
 #
 # XET=1 turns the Xet backend back on. It is OFF by default because it stalled on some
 # Spark setups -- that is the reason for HF_HUB_DISABLE_XET below, not a speed judgement.

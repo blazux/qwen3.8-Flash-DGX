@@ -270,6 +270,23 @@ to `qwen38-flash` and `18300`, like `serve.sh`.
 - The base image is multi-arch, so `docker build` also works on x86 Blackwell
   (sm_120, e.g. RTX PRO 6000) for testing, though this is tuned for the Spark.
 
+**Download speed.** `scripts/download-weights.sh` disables the Xet backend, because it
+stalled on some Spark setups. That is a stability choice, not a speed one, and on a fast
+link it costs a lot: `--max-workers` parallelises across *files*, so a checkpoint that is
+a dozen large shards leaves most of a gigabit idle. Measured on a DGX Spark on gigabit
+fibre, pulling 81 GB:
+
+| | rate | 81 GB takes |
+|---|---|---|
+| plain HTTPS, 8 workers (default) | 14.7 MB/s (117 Mbit/s) | ~92 min |
+| `XET=1` | **101 MB/s (809 Mbit/s)** | **13.4 min** |
+
+`XET=1` opts back in, and Xet-backed repos are the ones whose API tree entries carry an
+`xetHash`. It stays off by default because that run still ended in an `httpx.ReadTimeout`
+*after* the last file completed — every blob was intact, but the exit code was non-zero,
+so anything that trusts it will think the download failed. Re-run to confirm; it is
+resumable, and a finished download re-checks in seconds.
+
 ## Quickstart
 
 The commands are in the [TL;DR](#tldr--run-it-on-a-dgx-spark) at the top. Once the log says
@@ -758,7 +775,7 @@ src/patch_qsa_fp8_kv.py           7. fp8_e4m3 KV cache on the QSA path (by @Nane
 src/test_ple_mmap_cpu.py          CPU unit test for the gather (no GPU needed)
 src/test_qsa_exact_topk_cpu.py    CPU unit test for the exact top-k (no GPU needed)
 tools/fp8_convert.py              side-layer bf16 -> blockwise fp8 (by @Saren-Arterius)
-scripts/download-weights.sh
+scripts/download-weights.sh       MODEL, EXCLUDE, MAX_WORKERS, XET
 scripts/prepare-hybrid.sh         one-time: build the -fp8hybrid snapshot
 scripts/prepare-mtp-graft.sh      one-time: graft the NVFP4 MTP draft experts onto it (MODE=hybrid-mtp)
 tools/vllm_watch.py               live per-session view of prompts / reasoning / outputs / stats (needs LOG_REQUESTS=1; @0x3dlux)

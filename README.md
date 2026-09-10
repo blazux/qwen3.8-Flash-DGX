@@ -567,7 +567,39 @@ Full port notes in [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md#the-vllm-v0290-po
 | `PREWARM` | `0` | `1` streams the 48 GiB table once at boot to warm the page cache — steadier first-request latency, ~10 s extra startup. |
 | `WORKERS` | `32` | Threads used for the mmap gather (only used above `VLLM_PLE_MMAP_FAST_ROWS`=512 unique rows; decode-sized gathers run inline). |
 | `LOG_REQUESTS` | `0` | `1` logs every prompt and output (`VLLM_LOGGING_LEVEL=DEBUG --enable-log-requests --enable-log-outputs`) so `tools/vllm_watch.py` can show sessions live. Debugging only: it puts user content in the Docker log, unbounded. |
+| `KV_CACHE_MEM` | | Passed through as `--kv-cache-memory-bytes`. `GPU_MEM` is a fraction of *total* device memory, so it leaves whatever was already resident on the table; vLLM prints the exact figure it would accept at startup ("Replace gpu_memory_utilization config with `--kv-cache-memory=...`"). On a Spark that headroom is also what the page cache uses for the PLE table, so taking it is a trade, not free memory — watch `vllm:ple_mmap_gather_seconds_total` when you do. |
 | `EXTRA` | | Extra vLLM flags, passed verbatim — e.g. `--long-prefill-token-threshold 1024` for multi-client responsiveness (see [the concurrency section](#decoding-clients-stall-while-other-clients-prefill-the-long-prefill-token-threshold-slider)), `--api-key <secret>`. |
+
+### Watching the mmapped table (`vllm:ple_mmap_*`)
+
+The PLE table is the one component whose cost depends on runtime state rather than
+configuration: how much of its 47.7 GiB the page cache is holding decides your prefill
+speed, and that moves as the KV pool, the request mix and the OS all pull on the same
+unified memory. The module exports five counters so this is visible on a dashboard
+rather than only in a windowed log line that a container restart destroys:
+
+```
+vllm:ple_mmap_lookup_ops_total       lookups (hash + gather + H2D)
+vllm:ple_mmap_op_seconds_total       cumulative seconds in the lookup op
+vllm:ple_mmap_gather_seconds_total   cumulative seconds in the row gather (disk reads)
+vllm:ple_mmap_rows_total             rows gathered
+vllm:ple_mmap_bytes_total            bytes read from the table
+```
+
+They are registered in the EngineCore process and reach `/metrics` through
+prometheus_client's `MultiProcessCollector`, which vLLM already sets up. The three
+views worth graphing:
+
+```promql
+rate(vllm:ple_mmap_op_seconds_total[5m]) / rate(vllm:ple_mmap_lookup_ops_total[5m])
+rate(vllm:ple_mmap_gather_seconds_total[5m]) / rate(vllm:ple_mmap_op_seconds_total[5m])
+rate(vllm:ple_mmap_bytes_total[5m])
+```
+
+The middle one is the page-cache health signal — the share of each lookup spent waiting
+on disk. It climbs as the cache is squeezed and falls as the hot region settles in. Pair
+it with `Cached` from a node exporter, since nothing in vLLM's own metrics exposes the
+quantity that actually governs it. `VLLM_PLE_MMAP_PROMETHEUS=0` turns the counters off.
 
 ## Throughput and concurrency
 

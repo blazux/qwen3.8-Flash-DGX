@@ -32,6 +32,12 @@
 #   YARN=0            1 = YaRN rope scaling (factor 4) for CTX > 262144
 #   SEQS=8            max concurrent sequences. Do NOT leave this at 1-2 when measuring
 #                     throughput: requests queue silently and aggregate tok/s flatlines
+#   KV_CACHE_MEM=     bytes for the KV cache, as --kv-cache-memory-bytes. GPU_MEM is a fraction of
+#                     TOTAL device memory, so it also leaves out whatever was already resident;
+#                     vLLM prints the exact value it would accept at startup ("Replace
+#                     gpu_memory_utilization config with --kv-cache-memory=..."). On a Spark the
+#                     headroom it reports is also what the page cache uses for the PLE table, so
+#                     claiming it trades prefill for KV. Watch vllm:ple_mmap_gather_seconds_total
 #   GPU_MEM=0.80      fraction of the 128 GB pool for weights+KV. 0.85 buys ~2 GiB of KV but the
 #                     box drifted into swap after a day at it; 0.875 got OOM-killed on a 300k prefill
 #   MTP=2             speculative tokens from the model's MTP head (0 = off)
@@ -63,6 +69,7 @@ SEQS="${SEQS:-8}"
 GPU_MEM="${GPU_MEM:-0.80}"
 MTP="${MTP:-2}"
 KV_DTYPE="${KV_DTYPE:-auto}"
+KV_CACHE_MEM="${KV_CACHE_MEM:-}"
 PREWARM="${PREWARM:-0}"
 EXTRA="${EXTRA:-}"
 
@@ -169,7 +176,7 @@ docker run -d --name "$NAME" --restart unless-stopped \
     $PC_ARG --enable-chunked-prefill --max-num-batched-tokens 8192 \
     $CC \
     --no-enable-flashinfer-autotune \
-    --kv-cache-dtype "$KV_DTYPE" \
+    --kv-cache-dtype "$KV_DTYPE" ${KV_CACHE_MEM:+--kv-cache-memory-bytes "$KV_CACHE_MEM"} \
     "${OVR_ARGS[@]}" "${LOGARGS[@]}" $EXTRA \
     --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 \
     "${SPEC[@]}"

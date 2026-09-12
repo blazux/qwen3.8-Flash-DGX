@@ -270,6 +270,23 @@ to `qwen38-flash` and `18300`, like `serve.sh`.
 - The base image is multi-arch, so `docker build` also works on x86 Blackwell
   (sm_120, e.g. RTX PRO 6000) for testing, though this is tuned for the Spark.
 
+**Download speed.** `scripts/download-weights.sh` disables the Xet backend, because it
+stalled on some Spark setups. That is a stability choice, not a speed one, and on a fast
+link it costs a lot: `--max-workers` parallelises across *files*, so a checkpoint that is
+a dozen large shards leaves most of a gigabit idle. Measured on a DGX Spark on gigabit
+fibre, pulling 81 GB:
+
+| | rate | 81 GB takes |
+|---|---|---|
+| plain HTTPS, 8 workers (default) | 14.7 MB/s (117 Mbit/s) | ~92 min |
+| `XET=1` | **101 MB/s (809 Mbit/s)** | **13.4 min** |
+
+`XET=1` opts back in, and Xet-backed repos are the ones whose API tree entries carry an
+`xetHash`. It stays off by default because that run still ended in an `httpx.ReadTimeout`
+*after* the last file completed — every blob was intact, but the exit code was non-zero,
+so anything that trusts it will think the download failed. Re-run to confirm; it is
+resumable, and a finished download re-checks in seconds.
+
 ## Quickstart
 
 The commands are in the [TL;DR](#tldr--run-it-on-a-dgx-spark) at the top. Once the log says
@@ -567,7 +584,50 @@ Full port notes in [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md#the-vllm-v0290-po
 | `PREWARM` | `0` | `1` streams the 48 GiB table once at boot to warm the page cache — steadier first-request latency, ~10 s extra startup. |
 | `WORKERS` | `32` | Threads used for the mmap gather (only used above `VLLM_PLE_MMAP_FAST_ROWS`=512 unique rows; decode-sized gathers run inline). |
 | `LOG_REQUESTS` | `0` | `1` logs every prompt and output (`VLLM_LOGGING_LEVEL=DEBUG --enable-log-requests --enable-log-outputs`) so `tools/vllm_watch.py` can show sessions live. Debugging only: it puts user content in the Docker log, unbounded. |
+| `PROM_MULTIPROC` | `0` | `1` runs prometheus_client in multiprocess mode so engine-side metrics (`vllm:ple_mmap_*`) reach `/metrics`. Opt-in, because it stops vLLM exporting its `*_created` samples; see *Watching the mmapped table* below. |
+| `KV_CACHE_MEM` | | Passed through as `--kv-cache-memory-bytes`. `GPU_MEM` is a fraction of *total* device memory, so it leaves whatever was already resident on the table; vLLM prints the exact figure it would accept at startup ("Replace gpu_memory_utilization config with `--kv-cache-memory=...`"). On a Spark that headroom is also what the page cache uses for the PLE table, so taking it is a trade, not free memory — watch `vllm:ple_mmap_gather_seconds_total` when you do. |
 | `EXTRA` | | Extra vLLM flags, passed verbatim — e.g. `--long-prefill-token-threshold 1024` for multi-client responsiveness (see [the concurrency section](#decoding-clients-stall-while-other-clients-prefill-the-long-prefill-token-threshold-slider)), `--api-key <secret>`. |
+
+### Watching the mmapped table (`vllm:ple_mmap_*`)
+
+The PLE table is the one component whose cost depends on runtime state rather than
+configuration: how much of its 47.7 GiB the page cache is holding decides your prefill
+speed, and that moves as the KV pool, the request mix and the OS all pull on the same
+unified memory. The module exports five counters so this is visible on a dashboard
+rather than only in a windowed log line that a container restart destroys:
+
+```
+vllm:ple_mmap_lookup_ops_total       lookups (hash + gather + H2D)
+vllm:ple_mmap_op_seconds_total       cumulative seconds in the lookup op
+vllm:ple_mmap_gather_seconds_total   cumulative seconds in the row gather (disk reads)
+vllm:ple_mmap_rows_total             rows gathered
+vllm:ple_mmap_bytes_total            bytes read from the table
+```
+
+They are registered in the EngineCore process, so they only reach `/metrics` when
+prometheus_client runs in multiprocess mode. vLLM turns that on only for
+`api_server_count > 1`; `scripts/serve.sh` does it for the single-server setup used here when you opt in with
+`PROM_MULTIPROC=1`, by pointing `PROMETHEUS_MULTIPROC_DIR` at a fresh tmpfs.
+
+Switching to multiprocess mode was checked against a live server by diffing the
+complete `/metrics` before and after: vLLM's other 71 metric families are exported with
+identical label sets and no per-process `pid` label. The only loss is the 35
+`*_created` families, which prometheus_client does not export in multiprocess mode; that is why
+exporting the counters is opt-in, so nothing changes for existing dashboards unless you
+ask for it.
+
+The three views worth graphing:
+
+```promql
+rate(vllm:ple_mmap_op_seconds_total[5m]) / rate(vllm:ple_mmap_lookup_ops_total[5m])
+rate(vllm:ple_mmap_gather_seconds_total[5m]) / rate(vllm:ple_mmap_op_seconds_total[5m])
+rate(vllm:ple_mmap_bytes_total[5m])
+```
+
+The middle one is the page-cache health signal — the share of each lookup spent waiting
+on disk. It climbs as the cache is squeezed and falls as the hot region settles in. Pair
+it with `Cached` from a node exporter, since nothing in vLLM's own metrics exposes the
+quantity that actually governs it. `VLLM_PLE_MMAP_PROMETHEUS=0` turns the counters off.
 
 ## Throughput and concurrency
 
@@ -726,7 +786,7 @@ src/patch_qsa_fp8_kv.py           7. fp8_e4m3 KV cache on the QSA path (by @Nane
 src/test_ple_mmap_cpu.py          CPU unit test for the gather (no GPU needed)
 src/test_qsa_exact_topk_cpu.py    CPU unit test for the exact top-k (no GPU needed)
 tools/fp8_convert.py              side-layer bf16 -> blockwise fp8 (by @Saren-Arterius)
-scripts/download-weights.sh
+scripts/download-weights.sh       MODEL, EXCLUDE, MAX_WORKERS, XET
 scripts/prepare-hybrid.sh         one-time: build the -fp8hybrid snapshot
 scripts/prepare-mtp-graft.sh      one-time: graft the NVFP4 MTP draft experts onto it (MODE=hybrid-mtp)
 tools/vllm_watch.py               live per-session view of prompts / reasoning / outputs / stats (needs LOG_REQUESTS=1; @0x3dlux)

@@ -35,6 +35,7 @@ Knobs (env):
   VLLM_PLE_MMAP_WORKERS=32   gather threads (page faults overlap across threads)
   VLLM_PLE_MMAP_CHUNK=2048   rows per gather task
   VLLM_PLE_MMAP_MADVISE=random  madvise on the shard mmaps: random (default, no readahead) or normal
+  VLLM_PLE_MMAP_PROMETHEUS=1 0 = do not register the vllm:ple_mmap_* counters
   VLLM_PLE_MMAP_PREWARM=0    1 = stream the whole table once at load to fill the
                              page cache with whatever memory is free (harmless,
                              evictable; ~10 s at 4.7 GB/s)
@@ -169,9 +170,12 @@ class MmapPleTable:
         try:
             return self._gather(ids)
         finally:
-            _STATS["gather_ms"] += (_time.perf_counter() - t0) * 1e3
-            _STATS["rows"] += int(np.asarray(ids).size)
-            _STATS["bytes"] += int(np.asarray(ids).size) * self.row_bytes
+            dt = _time.perf_counter() - t0
+            n = int(np.asarray(ids).size)
+            _STATS["gather_ms"] += dt * 1e3
+            _STATS["rows"] += n
+            _STATS["bytes"] += n * self.row_bytes
+            _prom_add(gather_s=dt, rows=n, bytes=n * self.row_bytes)
 
     def _gather(self, ids: np.ndarray) -> np.ndarray:
         ids = np.ascontiguousarray(ids, dtype=np.int64).reshape(-1)
@@ -392,6 +396,92 @@ _OP_NAME = "ple_mmap_lookup"
 # Aggregate gather-overhead stats, logged every VLLM_PLE_MMAP_STATS_SEC seconds
 # (0 = off). op_ms covers hashing + gather + H2D; gather_ms just the disk reads.
 _STATS = {"calls": 0, "op_ms": 0.0, "gather_ms": 0.0, "rows": 0, "bytes": 0}
+
+# The same numbers as monotonic Prometheus counters, so the table's behaviour is
+# visible on a dashboard instead of only in the log line below (which is windowed,
+# reset every period, and destroyed with the container). Nothing else in this
+# recipe exposes how the mmapped table is coping: it is the one component whose
+# cost depends on runtime state (page-cache residency) rather than on config, so
+# it is exactly the thing worth graphing.
+#
+# These live in the EngineCore process, not the API server, so they only reach the
+# frontend's /metrics when prometheus_client runs in multiprocess mode: the API
+# server's MultiProcessCollector then aggregates what every process writes under
+# PROMETHEUS_MULTIPROC_DIR. vLLM only turns that on for api_server_count > 1;
+# scripts/serve.sh sets it when PROM_MULTIPROC=1 (opt-in). They are created lazily on first use,
+# because the env var must be set before the first metric is constructed.
+#
+# Derived views worth having:
+#   rate(vllm:ple_mmap_op_seconds_total[5m])
+#     / rate(vllm:ple_mmap_lookup_ops_total[5m])      mean seconds per lookup
+#   rate(vllm:ple_mmap_gather_seconds_total[5m])
+#     / rate(vllm:ple_mmap_op_seconds_total[5m])      fraction of the op spent on disk
+#   rate(vllm:ple_mmap_bytes_total[5m])               NVMe read bandwidth from the table
+# The second one is the page-cache health signal: it climbs as the cache is
+# squeezed and falls as the hot region settles in.
+_PROM: dict[str, object] | None = None
+_PROM_TRIED = False
+
+
+def _prom() -> dict[str, object] | None:
+    """Prometheus counters, or None if unavailable. Never raises, tried once."""
+    global _PROM, _PROM_TRIED
+    if _PROM_TRIED:
+        return _PROM
+    _PROM_TRIED = True
+    if os.environ.get("VLLM_PLE_MMAP_PROMETHEUS", "1").lower() in ("0", "false", "no"):
+        return None
+    if not os.environ.get("PROMETHEUS_MULTIPROC_DIR"):
+        # The default. vLLM only enables multiprocess metrics for api_server_count > 1,
+        # and exporting these costs vLLM its *_created samples, so it is opt-in: say how
+        # to turn it on rather than warn about the expected configuration.
+        logger.info(
+            "PLE mmap: PROMETHEUS_MULTIPROC_DIR is unset, so the vllm:ple_mmap_* counters "
+            "stay in this process and will not appear on /metrics while the engine runs "
+            "in its own process. scripts/serve.sh exports them with PROM_MULTIPROC=1."
+        )
+    try:
+        from prometheus_client import Counter
+
+        _PROM = {
+            "ops": Counter(
+                "vllm:ple_mmap_lookup_ops_total",
+                "PLE mmap lookups (hash + gather + H2D) executed.",
+            ),
+            "op_s": Counter(
+                "vllm:ple_mmap_op_seconds_total",
+                "Cumulative seconds in the PLE mmap lookup op.",
+            ),
+            "gather_s": Counter(
+                "vllm:ple_mmap_gather_seconds_total",
+                "Cumulative seconds in the PLE mmap row gather (the disk reads).",
+            ),
+            "rows": Counter(
+                "vllm:ple_mmap_rows_total",
+                "Rows gathered from the mmapped PLE table.",
+            ),
+            "bytes": Counter(
+                "vllm:ple_mmap_bytes_total",
+                "Bytes read from the mmapped PLE table (page cache or NVMe).",
+            ),
+        }
+        logger.info("PLE mmap: Prometheus counters registered")
+    except Exception as exc:  # pragma: no cover - metrics must never break serving
+        logger.warning("PLE mmap: Prometheus counters unavailable: %s", exc)
+        _PROM = None
+    return _PROM
+
+
+def _prom_add(**kw: float) -> None:
+    """Best-effort counter increment; a metrics failure must not fail a request."""
+    p = _prom()
+    if not p:
+        return
+    try:
+        for key, value in kw.items():
+            p[key].inc(value)  # type: ignore[attr-defined]
+    except Exception:  # pragma: no cover
+        pass
 _STATS_LAST = [0.0]
 _STATS_SEC = _env_int("VLLM_PLE_MMAP_STATS_SEC", 30)
 
@@ -432,8 +522,10 @@ def _lookup_impl(
         None, input_ids, query_start_loc, ngram_context
     )
     output[: result.shape[0]].copy_(result.to(output.dtype))
+    dt = _time.perf_counter() - t0
     _STATS["calls"] += 1
-    _STATS["op_ms"] += (_time.perf_counter() - t0) * 1e3
+    _STATS["op_ms"] += dt * 1e3
+    _prom_add(ops=1, op_s=dt)
     _stats_log()
 
 
@@ -458,8 +550,10 @@ def _lookup_ids_impl(ngram_ids: torch.Tensor, output: torch.Tensor, layer_name: 
     layer = _REGISTRY[layer_name]
     rows = layer.ngram_embedding(ngram_ids)  # (N, heads, head_dim), table dtype (or zeros)
     output.copy_(rows.reshape(rows.shape[0], -1).to(output.dtype))
+    dt = _time.perf_counter() - t0
     _STATS["calls"] += 1
-    _STATS["op_ms"] += (_time.perf_counter() - t0) * 1e3
+    _STATS["op_ms"] += dt * 1e3
+    _prom_add(ops=1, op_s=dt)
     _stats_log()
 
 

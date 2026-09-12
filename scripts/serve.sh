@@ -32,6 +32,13 @@
 #   YARN=0            1 = YaRN rope scaling (factor 4) for CTX > 262144
 #   SEQS=8            max concurrent sequences. Do NOT leave this at 1-2 when measuring
 #                     throughput: requests queue silently and aggregate tok/s flatlines
+#   PROM_MULTIPROC=0  1 = engine-side metrics (vllm:ple_mmap_*) reach /metrics (opt-in; see PROM_ARGS below)
+#   KV_CACHE_MEM=     bytes for the KV cache, as --kv-cache-memory-bytes. GPU_MEM is a fraction of
+#                     TOTAL device memory, so it also leaves out whatever was already resident;
+#                     vLLM prints the exact value it would accept at startup ("Replace
+#                     gpu_memory_utilization config with --kv-cache-memory=..."). On a Spark the
+#                     headroom it reports is also what the page cache uses for the PLE table, so
+#                     claiming it trades prefill for KV. Watch vllm:ple_mmap_gather_seconds_total
 #   GPU_MEM=0.80      fraction of the 128 GB pool for weights+KV. 0.85 buys ~2 GiB of KV but the
 #                     box drifted into swap after a day at it; 0.875 got OOM-killed on a 300k prefill
 #   MTP=2             speculative tokens from the model's MTP head (0 = off)
@@ -63,6 +70,8 @@ SEQS="${SEQS:-8}"
 GPU_MEM="${GPU_MEM:-0.80}"
 MTP="${MTP:-2}"
 KV_DTYPE="${KV_DTYPE:-auto}"
+KV_CACHE_MEM="${KV_CACHE_MEM:-}"
+PROM_MULTIPROC="${PROM_MULTIPROC:-0}"
 PREWARM="${PREWARM:-0}"
 EXTRA="${EXTRA:-}"
 
@@ -151,6 +160,17 @@ LOGARGS=(); [ "$LOG_REQUESTS" = 1 ] && { DETENV+=(-e VLLM_LOGGING_LEVEL=DEBUG); 
 PC_ARG=--no-enable-prefix-caching
 [ "$PREFIX_CACHE" = 1 ] && PC_ARG=--enable-prefix-caching
 
+# PROM_MULTIPROC=1 (opt-in): the vllm:ple_mmap_* counters (src/vllm_ple_mmap.py) live in the
+# EngineCore process. vLLM only puts prometheus_client into multiprocess mode for
+# api_server_count > 1, so with the single API server used here they would sit in
+# EngineCore's private registry and never reach /metrics. Setting
+# PROMETHEUS_MULTIPROC_DIR here makes /metrics aggregate every vLLM process; the tmpfs
+# is fresh per container, so no stale per-process files survive a restart.
+# Measured against a single-process /metrics: vLLM's own series keep their names and
+# labels, with no per-process pid label; the only loss is the *_created samples, which
+# prometheus_client does not export in multiprocess mode. That is why it is off
+# by default: it changes what existing dashboards see.
+PROM_ARGS=(); [ "$PROM_MULTIPROC" = 1 ] && PROM_ARGS=(--tmpfs /tmp/vllm-prometheus:rw,size=256m -e PROMETHEUS_MULTIPROC_DIR=/tmp/vllm-prometheus)
 docker rm -f "$NAME" >/dev/null 2>&1 || true
 # If docker run itself fails (port already bound, ...) do not leave a Created container behind.
 trap 'rc=$?; [ $rc -ne 0 ] && docker rm -f "$NAME" >/dev/null 2>&1; exit $rc' EXIT
@@ -158,6 +178,7 @@ trap 'rc=$?; [ $rc -ne 0 ] && docker rm -f "$NAME" >/dev/null 2>&1; exit $rc' EX
 docker run -d --name "$NAME" --restart unless-stopped \
   --gpus all --ipc=host --shm-size 16g -p "${PORT}:8000" \
   -v "$HF_CACHE:/hf" -e HF_HOME=/hf -e HF_HUB_OFFLINE=1 \
+  "${PROM_ARGS[@]}" \
   -e VLLM_PLE_MMAP=1 -e VLLM_PLE_MMAP_WORKERS="${WORKERS:-32}" -e VLLM_PLE_MMAP_PREWARM="$PREWARM" \
   -e VLLM_QSA_EXACT_TOPK="$EXACT_TOPK" "${DETENV[@]}" -e VLLM_FP8_PAD_M4="$PAD_M4" \
   -e VLLM_USE_FLASHINFER_SAMPLER=1 -e VLLM_ALLOW_LONG_MAX_MODEL_LEN="$ALLOW_LONG" \
@@ -169,7 +190,7 @@ docker run -d --name "$NAME" --restart unless-stopped \
     $PC_ARG --enable-chunked-prefill --max-num-batched-tokens 8192 \
     $CC \
     --no-enable-flashinfer-autotune \
-    --kv-cache-dtype "$KV_DTYPE" \
+    --kv-cache-dtype "$KV_DTYPE" ${KV_CACHE_MEM:+--kv-cache-memory-bytes "$KV_CACHE_MEM"} \
     "${OVR_ARGS[@]}" "${LOGARGS[@]}" $EXTRA \
     --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 \
     "${SPEC[@]}"

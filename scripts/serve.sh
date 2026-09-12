@@ -56,6 +56,7 @@ PAD_M4="${PAD_M4:-0}"
 DRAFT_VOCAB="${DRAFT_VOCAB:-1}"
 MADVISE="${MADVISE:-random}"
 LOG_REQUESTS="${LOG_REQUESTS:-0}"
+REASONING_EOS_GUARD="${REASONING_EOS_GUARD:-0}"
 PORT="${PORT:-18300}"
 CTX="${CTX:-262144}"
 YARN="${YARN:-0}"
@@ -119,6 +120,13 @@ if [ "$BASE" = "v0.29" ]; then
   fi
   [ "$PAD_M4" != 0 ] && echo "!! PAD_M4 has no effect on the v0.29 base (vllm#52775 fixed the fp8 GEMM there); ignoring" && PAD_M4=0
 fi
+REASONING_ARGS=()
+if [ "$REASONING_EOS_GUARD" = 1 ]; then
+  if [ "$BASE" != "v0.29" ]; then
+    echo "!! REASONING_EOS_GUARD requires the v0.29 image" >&2; exit 1
+  fi
+  REASONING_ARGS=(--reasoning-config '{"suppress_eos_in_reasoning":true}')
+fi
 CC="${CC:--cc.cudagraph_mode=PIECEWISE -cc.splitting_ops=$SPLIT}"
 
 # YaRN (Qwen's published recipe) to go past the native 262144.
@@ -171,7 +179,7 @@ docker run -d --name "$NAME" --restart unless-stopped \
     --no-enable-flashinfer-autotune \
     --kv-cache-dtype "$KV_DTYPE" \
     "${OVR_ARGS[@]}" "${LOGARGS[@]}" $EXTRA \
-    --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 \
+    --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 ${REASONING_ARGS[@]+"${REASONING_ARGS[@]}"} \
     "${SPEC[@]}"
 
 # Fail loudly instead of printing a success line over a dead container: give vLLM a few

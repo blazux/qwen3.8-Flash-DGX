@@ -546,6 +546,37 @@ boot-to-boot range of the preview image). **The preview `Dockerfile` remains the
 field time on our own box; if you want to be on the release line, it is ready and tested.
 Full port notes in [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md#the-vllm-v0290-port-dockerfilev029).
 
+### Reasoning EOS recovery and quoted tool markers (v0.29 image)
+
+An EOS token sampled while Qwen is still reasoning can produce a successful HTTP
+response with no answer. The v0.29 image includes an opt-in sampler guard:
+
+```bash
+IMAGE=qwen38-flash-dgx:v0.29 REASONING_EOS_GUARD=1 scripts/serve.sh
+```
+
+The guard masks the model's EOS IDs while a reasoning section is open. It does
+not force `</think>`, insert an answer, or set a thinking budget. Natural reasoning
+endings and valid direct tool transitions restore normal EOS handling. Explicit
+`ignore_eos` and output limits keep their usual meaning. Both model runners and
+MTP verification use the guard; rejected draft tokens never advance its state.
+
+A quoted malformed `<tool_call>` followed by prose is also preserved in its
+original reasoning/content channel. Whitespace followed by a valid `<function=`
+header continues to start a tool call. A malformed opener does not disable the
+EOS guard.
+
+This changes generation only when EOS would otherwise end an open reasoning
+section, so answer quality still needs workload evaluation. EOS in final-answer
+text remains a protocol terminator: this option does not make literal special
+tokens safe to quote everywhere. The preview image does not carry these patches.
+
+The regression patch in `src/patches/v029-reasoning-regressions.patch` applies to
+a vLLM `v0.29.0` source checkout. Apply the two runtime patches there as well and
+run the existing parser engine, thinking-budget state, and GPU thinking-budget
+suites. The GPU suite includes MTP 2/3/4, rejected drafts, reused request slots,
+multi-token markers, and a prompt near the native context boundary.
+
 ## Tuning (env vars for `scripts/serve.sh`)
 
 | Var | Default | Notes |
@@ -562,6 +593,7 @@ Full port notes in [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md#the-vllm-v0290-po
 | `YARN` | `0` | `1` = YaRN rope scaling (factor 4, Qwen's recipe) for `CTX` > 262144. |
 | `SEQS` | `8` | Max concurrent sequences. **Do not benchmark with 1–2**: excess requests queue silently and aggregate tok/s flatlines (see below). |
 | `GPU_MEM` | `0.80` | Fraction of the 128 GB pool for weights+KV. `0.85` buys ~2 GiB more KV, but after a day at `0.85` the box drifted into swap, and `0.875` got OOM-killed on a 300k-token prefill with MTP. The lower you set it, the more RAM the page cache has for the 48 GiB table — which is what your prefill speed depends on (below). Right after stopping another big container the first boot can fail with "13.5 GiB KV cache is needed, larger than available" — memory not yet released; the `unless-stopped` retry succeeds. |
+| `REASONING_EOS_GUARD` | `0` | v0.29 only: suppress EOS while reasoning is open, without forcing it to end. |
 | `MTP` | `2` | Speculative tokens from the model's MTP head (`0` = off). `3` is +7% decode but cost a point at the tournament (44 vs 45/51), so it stays an option. |
 | `KV_DTYPE` | `auto` | `auto` = bf16 (recommended). `fp8_e4m3` = ~1.9× KV pool, 1M context on one box, at −10% decode / −30% prefill and a measurable quality cost — see [fp8 KV cache](docs/HOW-IT-WORKS.md#fp8-kv-cache-on-the-qsa-path-opt-in) before using it. |
 | `PREWARM` | `0` | `1` streams the 48 GiB table once at boot to warm the page cache — steadier first-request latency, ~10 s extra startup. |

@@ -1,0 +1,357 @@
+diff --git a/tests/parser/engine/test_qwen3_reasoning.py b/tests/parser/engine/test_qwen3_reasoning.py
+index a9bec49..eba945e 100644
+--- a/tests/parser/engine/test_qwen3_reasoning.py
++++ b/tests/parser/engine/test_qwen3_reasoning.py
+@@ -16,11 +16,13 @@ import pytest
+ from tests.parser.engine.conftest import make_mock_tokenizer
+ from tests.parser.engine.streaming_helpers import simulate_reasoning_streaming
+ from vllm.parser.abstract_parser import DelegatingParser
++from vllm.parser.engine.events import EventType
+ from vllm.parser.engine.parser_engine_config import ParserState
+ from vllm.parser.engine.registered_adapters import (
+     Qwen3ParserReasoningAdapter,
+     Qwen3ParserToolAdapter,
+ )
++from vllm.parser.engine.streaming_parser_engine import StreamingParserEngine
+ from vllm.parser.qwen3 import Qwen3Parser, qwen3_config
+ 
+ _THINK_START_ID = 50
+@@ -56,7 +58,53 @@ def parser(mock_tokenizer):
+     return Qwen3Parser(mock_tokenizer)
+ 
+ 
++@pytest.mark.parametrize("thinking", [True, False])
++@pytest.mark.parametrize("chunk_size", [1, 7, 1000])
++def test_malformed_tool_preamble_is_lossless_across_chunks(thinking, chunk_size):
++    text = "Quoted `<tool_call>` prose </tool_call> still visible."
++    engine = StreamingParserEngine(qwen3_config(thinking=thinking), None)
++    events = []
++    for offset in range(0, len(text), chunk_size):
++        events.extend(engine.feed(text[offset : offset + chunk_size], []))
++    events.extend(engine.finish())
++    kind = EventType.REASONING_CHUNK if thinking else EventType.TEXT_CHUNK
++    assert "".join(e.value for e in events if e.type == kind) == text
++    assert not any(e.type == EventType.TOOL_CALL_START for e in events)
++
++
++def test_malformed_special_token_then_real_tool_preserves_tool_index(mock_tokenizer):
++    engine = StreamingParserEngine(qwen3_config(), mock_tokenizer)
++    events = engine.feed("<tool_call>", [_TOOL_CALL_ID])
++    assert not events
++    events += engine.feed("` quoted marker. ", [])
++    events += engine.feed("<tool_call>", [_TOOL_CALL_ID])
++    events += engine.feed("\n<function=bash><parameter=cmd>pwd</parameter>", [])
++    events += engine.feed("</function></tool_call>", [_TOOL_CALL_END_ID])
++    events += engine.finish()
++    assert (
++        "".join(e.value for e in events if e.type == EventType.REASONING_CHUNK)
++        == "<tool_call>` quoted marker. "
++    )
++    starts = [e for e in events if e.type == EventType.TOOL_CALL_START]
++    assert len(starts) == 1
++    assert starts[0].tool_index == 0
++    assert "".join(e.value for e in events if e.type == EventType.TOOL_NAME) == "bash"
++
++
+ class TestNonStreaming:
++    @pytest.mark.parametrize(
++        "candidate",
++        [
++            "<tool_call>` ordinary prose continues",
++            "<tool_call>quoted text</tool_call>",
++        ],
++    )
++    def test_malformed_tool_preamble_preserves_reasoning(self, parser, candidate):
++        text = "The literal marker is `" + candidate
++        reasoning, content = parser.extract_reasoning(text, None)
++        assert reasoning == text
++        assert content is None
++
+     def test_reasoning_then_content(self, parser):
+         text = "<think>Let me analyze.</think>The answer is 42."
+         reasoning, content = parser.extract_reasoning(text, None)
+@@ -261,6 +309,19 @@ class TestIsReasoningEndTurnBoundaries:
+         parser = Qwen3Parser(make_mock_tokenizer(vocab))
+         assert parser.is_reasoning_end([_TEXT_ID, _THINK_END_ID, _TEXT_ID])
+ 
++    def test_boundary_with_thinking_disabled_is_end(self, mock_tokenizer):
++        """With thinking disabled (initial state CONTENT) a walk that stops at a turn
++        boundary must report reasoning as ended: the model never emits a marker."""
++        parser = Qwen3Parser(
++            mock_tokenizer, chat_template_kwargs={"enable_thinking": False}
++        )
++        assert parser.is_reasoning_end([_IM_START_ID, _TEXT_ID])
++
++    def test_boundary_with_thinking_enabled_not_end(self, parser):
++        """With thinking disabled (initial state REASONING) a walk that stops at a turn
++        boundary must keep reasoning open"""
++        assert not parser.is_reasoning_end([_IM_START_ID, _TEXT_ID])
++
+ 
+ class TestDelegatingPromptDetection:
+     def test_prompt_tool_example_does_not_skip_streaming_reasoning(
+diff --git a/tests/v1/sample/test_thinking_budget_state.py b/tests/v1/sample/test_thinking_budget_state.py
+index 943734e..561d31b 100644
+--- a/tests/v1/sample/test_thinking_budget_state.py
++++ b/tests/v1/sample/test_thinking_budget_state.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Unit tests for ThinkingBudgetStateHolder batch index moves."""
+ 
++import pytest
+ import torch
+ 
+ from vllm.sampling_params import SamplingParams
+@@ -93,3 +94,109 @@ def test_swap_exchanges_two_budgeted_states():
+     )
+     assert h._state[0]["thinking_token_budget"] == b1
+     assert h._state[1]["thinking_token_budget"] == b0
++
++
++class _EOSGuardConfig(_MockReasoningConfig):
++    suppress_eos_in_reasoning = True
++    reasoning_start_token_ids = [10]
++    reasoning_end_token_ids = [11]
++    natural_reasoning_end_token_ids = [11]
++    _eos_token_ids = [1, 2]
++    _tool_start_token_id = 12
++    _tool_end_token_id = 13
++    _tool_preamble_token_texts = {14: "<function=", 15: "\n", 17: "<function", 18: "="}
++
++
++@pytest.mark.parametrize("device", ["cpu", "cuda"])
++@pytest.mark.parametrize("draft_count", [0, 2, 3, 4])
++def test_eos_guard_preserves_reasoning_and_restores_normal_stop(device, draft_count):
++    """An unbudgeted request masks only model EOS, until a natural transition."""
++    if device == "cuda" and not torch.cuda.is_available():
++        pytest.skip("CUDA unavailable")
++    h = ThinkingBudgetStateHolder(
++        _EOSGuardConfig(), 2, draft_count, torch.device(device), False
++    )
++    h.sync_batch(BatchUpdate(1, (), [(0, SamplingParams(), [10], [])], ()))
++    draft = [[7] * draft_count]
++    h.update_state([[]], draft)
++    logits = torch.zeros(1, 20, device=device)
++    h.apply_to_logits(logits, True, draft)
++    assert torch.isneginf(logits[0, [1, 2]]).all()
++    assert torch.equal(logits[0, 3:], torch.zeros(17, device=device))
++    for end_tokens in ([11], [12, 14]):
++        h.sync_batch(BatchUpdate(1, (0,), [(0, SamplingParams(), [10], [])], ()))
++        h.update_state([[7, *end_tokens]], draft)
++        logits.zero_()
++        h.apply_to_logits(logits, True, draft)
++        assert (logits == 0).all()
++
++
++@pytest.mark.parametrize("draft", [[[7, 11, 7]], [[12, 14, 7]]])
++def test_eos_guard_uses_each_draft_prefix_without_committing_rejected_drafts(draft):
++    h = ThinkingBudgetStateHolder(_EOSGuardConfig(), 2, 3, torch.device("cpu"), False)
++    h.sync_batch(BatchUpdate(1, (), [(0, SamplingParams(), [10], [])], ()))
++    h.update_state([[]], draft)
++    bonus = h.apply_to_logits(torch.zeros(1, 20), True, draft)
++    target = h.apply_to_logits(torch.zeros(3, 20), False, draft)
++    assert (bonus == 0).all()
++    assert torch.isneginf(target[:2, [1, 2]]).all()
++    assert (target[2] == 0).all()
++    # The closing draft was rejected; only the first text token was committed.
++    h.update_state([[7]], [[7, 7, 7]])
++    bonus = h.apply_to_logits(torch.zeros(1, 20), True, [[7, 7, 7]])
++    assert torch.isneginf(bonus[0, [1, 2]]).all()
++
++
++def test_eos_guard_survives_batch_move_and_generated_reasoning_start():
++    h = ThinkingBudgetStateHolder(_EOSGuardConfig(), 2, 0, torch.device("cpu"), False)
++    h.sync_batch(BatchUpdate(2, (), [(0, SamplingParams(), [7], [])], ()))
++    h.update_state([[]], None)
++    assert (h.apply_to_logits(torch.zeros(1, 20), False, None) == 0).all()
++    h.update_state([[10, 7]], None)
++    h.sync_batch(BatchUpdate(2, (), (), [(0, 1, MoveDirectionality.SWAP)]))
++    h.update_state([[], [10, 7]], None)
++    logits = h.apply_to_logits(torch.zeros(2, 20), False, None)
++    assert (logits[0] == 0).all()
++    assert torch.isneginf(logits[1, [1, 2]]).all()
++
++
++def test_eos_guard_keeps_explicit_thinking_budget():
++    h = ThinkingBudgetStateHolder(_EOSGuardConfig(), 1, 0, torch.device("cpu"), False)
++    params = SamplingParams(thinking_token_budget=1)
++    h.sync_batch(BatchUpdate(1, (), [(0, params, [10], [])], ()))
++    h.update_state([[7]], None)
++    logits = h.apply_to_logits(torch.zeros(1, 20), False, None)
++    assert logits.argmax(-1).item() == 11
++    assert torch.isneginf(logits[0, [1, 2]]).all()
++
++
++def test_eos_guard_preserves_explicit_ignore_eos():
++    h = ThinkingBudgetStateHolder(_EOSGuardConfig(), 1, 0, torch.device("cpu"), False)
++    params = SamplingParams(ignore_eos=True)
++    h.sync_batch(BatchUpdate(1, (), [(0, params, [10], [])], ()))
++    h.update_state([[]], None)
++    assert (h.apply_to_logits(torch.zeros(1, 20), False, None) == 0).all()
++
++
++@pytest.mark.parametrize("draft_count", [0, 2, 3, 4])
++def test_quoted_tool_opener_keeps_reasoning_eos_masked(draft_count):
++    h = ThinkingBudgetStateHolder(
++        _EOSGuardConfig(), 1, draft_count, torch.device("cpu"), False
++    )
++    h.sync_batch(BatchUpdate(1, (), [(0, SamplingParams(), [10], [])], ()))
++    # The token following the tool opener is prose, not a function header.
++    output = [12, 16, 7]
++    draft = [[7] * draft_count]
++    h.update_state([output], draft)
++    assert torch.isneginf(
++        h.apply_to_logits(torch.zeros(1, 20), True, draft)[0, [1, 2]]
++    ).all()
++    # A subsequent genuine header may span tokens and decode steps.
++    output += [12, 15, 17]
++    h.update_state([output], draft)
++    assert torch.isneginf(
++        h.apply_to_logits(torch.zeros(1, 20), True, draft)[0, [1, 2]]
++    ).all()
++    output += [18]
++    h.update_state([output], draft)
++    assert (h.apply_to_logits(torch.zeros(1, 20), True, draft) == 0).all()
+diff --git a/tests/v1/worker/test_gpu_thinking_budget.py b/tests/v1/worker/test_gpu_thinking_budget.py
+index 2bc697b..8c4339d 100644
+--- a/tests/v1/worker/test_gpu_thinking_budget.py
++++ b/tests/v1/worker/test_gpu_thinking_budget.py
+@@ -299,3 +299,138 @@ def test_v2_thinking_budget_continues_end_prefix_from_prompt():
+ 
+     assert out[0, END_B] == pytest.approx(1.0e9)
+     assert out[0, END_A] == 0
++
++
++class MockEOSGuardConfig(MockReasoningConfig):
++    suppress_eos_in_reasoning = True
++    _eos_token_ids = [1, 2]
++    _tool_start_token_id = 94
++    _tool_end_token_id = 95
++    _tool_preamble_token_texts = {96: "<function=", 97: "\n", 98: "<function", 99: "="}
++
++
++@pytest.mark.parametrize("draft_count", [0, 2, 3, 4])
++@pytest.mark.parametrize(
++    "tail,active",
++    [
++        ([10], True),
++        ([END], False),
++        ([94, 96], False),
++        ([94, 60, 95, 10], True),
++        ([94, 97, 98], True),
++        ([94, 97, 98, 99], False),
++        ([94, 95], False),
++    ],
++)
++def test_v2_eos_guard_preserves_reasoning_and_tool_transitions(
++    draft_count, tail, active
++):
++    from vllm.v1.worker.gpu.sample.reasoning_eos import ReasoningEOSState
++
++    tokens = [START, *tail]
++    req_states = _make_req_states(tokens)
++    state = ReasoningEOSState(req_states, MockEOSGuardConfig())
++    state.add_request(3, SamplingParams())
++    state.apply_staged_writes()
++    logits = torch.zeros(draft_count + 1, VOCAB_SIZE, device=DEVICE)
++    out = _apply(
++        state, logits, [tokens[-1]] + [10] * draft_count, list(range(draft_count + 1))
++    )
++    assert torch.isneginf(out[:, [1, 2]]).all().item() is active
++    assert (out[:, 3:] == 0).all()
++
++
++@pytest.mark.parametrize("draft", [[10, END, 10], [94, 96, 10]])
++def test_v2_eos_guard_does_not_commit_rejected_draft_transition(draft):
++    from vllm.v1.worker.gpu.sample.reasoning_eos import ReasoningEOSState
++
++    req_states = _make_req_states([START, 10])
++    state = ReasoningEOSState(req_states, MockEOSGuardConfig())
++    state.add_request(3, SamplingParams())
++    state.apply_staged_writes()
++    out = _apply(
++        state, torch.zeros(4, VOCAB_SIZE, device=DEVICE), [10, *draft], [0, 1, 2, 3]
++    )
++    assert torch.isneginf(out[:2, [1, 2]]).all()
++    assert (out[2:] == 0).all()
++    # Only ordinary text is committed after rejection of the transition.
++    req_states.all_token_ids.stage_write(3, 2, [10])
++    req_states.total_len.stage_write_elem(3, 3)
++    req_states.apply_staged_writes()
++    out = _apply(state, torch.zeros(1, VOCAB_SIZE, device=DEVICE), [10], [0])
++    assert torch.isneginf(out[0, [1, 2]]).all()
++
++
++def test_v2_eos_guard_resumes_partial_header_and_resets_reused_slot():
++    from vllm.v1.worker.gpu.sample.reasoning_eos import ReasoningEOSState
++
++    req_states = _make_req_states([START, 94, 98])
++    state = ReasoningEOSState(req_states, MockEOSGuardConfig())
++    state.add_request(3, SamplingParams())
++    state.apply_staged_writes()
++    out = _apply(state, torch.zeros(1, VOCAB_SIZE, device=DEVICE), [98], [0])
++    assert torch.isneginf(out[0, [1, 2]]).all()
++    req_states.all_token_ids.stage_write(3, 3, [99])
++    req_states.total_len.stage_write_elem(3, 4)
++    req_states.apply_staged_writes()
++    out = _apply(state, torch.zeros(1, VOCAB_SIZE, device=DEVICE), [99], [0])
++    assert (out == 0).all()
++    req_states.remove_request("req")
++    req_states.add_request("next", 1, [START], 1, 32)
++    req_states.apply_staged_writes()
++    state.add_request(3, SamplingParams())
++    state.apply_staged_writes()
++    out = _apply(state, torch.zeros(1, VOCAB_SIZE, device=DEVICE), [START], [0])
++    assert torch.isneginf(out[0, [1, 2]]).all()
++
++
++@pytest.mark.parametrize("ignore_eos", [False, True])
++def test_v2_greedy_sampler_applies_eos_guard_and_honors_ignore_eos(ignore_eos):
++    req_states = _make_req_states([START, 10])
++    sampler = Sampler(
++        4, VOCAB_SIZE, DEVICE, req_states, reasoning_config=MockEOSGuardConfig()
++    )
++    sampler.add_request(3, 1, SamplingParams(temperature=0, ignore_eos=ignore_eos))
++    sampler.apply_staged_writes()
++    ids = torch.tensor([3], dtype=torch.int32, device=DEVICE)
++    out = sampler.apply_sampling_params(
++        torch.zeros(1, VOCAB_SIZE, device=DEVICE),
++        ids,
++        ids,
++        ids.cpu().numpy(),
++        torch.tensor([1], device=DEVICE),
++        torch.tensor([10], dtype=torch.int32, device=DEVICE),
++        torch.tensor([0], dtype=torch.int32, device=DEVICE),
++    ).cpu()
++    assert torch.isneginf(out[0, [1, 2]]).all().item() is not ignore_eos
++
++
++@pytest.mark.parametrize("prefix_len", [0, 2051, 262100])
++def test_v2_eos_guard_finds_markers_in_long_prompts(prefix_len):
++    from vllm.v1.worker.gpu.sample.reasoning_eos import ReasoningEOSState
++
++    tokens = [10] * prefix_len + [START, 94, 60, 10]
++    req_states = _make_req_states(tokens, prompt_len=len(tokens))
++    state = ReasoningEOSState(req_states, MockEOSGuardConfig())
++    state.add_request(3, SamplingParams())
++    state.apply_staged_writes()
++    out = _apply(state, torch.zeros(1, VOCAB_SIZE, device=DEVICE), [10], [0])
++    assert torch.isneginf(out[0, [1, 2]]).all()
++    assert state.scan_pos[3].item() == len(tokens)
++
++
++def test_v2_eos_guard_multi_token_markers_cross_draft_boundary():
++    from vllm.v1.worker.gpu.sample.reasoning_eos import ReasoningEOSState
++
++    config = MockEOSGuardConfig()
++    config.reasoning_start_token_ids = [START, END_A]
++    config.natural_reasoning_end_token_ids = [END_A, END_B]
++    req_states = _make_req_states([START, END_A, 10, END_A])
++    state = ReasoningEOSState(req_states, config)
++    state.add_request(3, SamplingParams())
++    state.apply_staged_writes()
++    out = _apply(
++        state, torch.zeros(2, VOCAB_SIZE, device=DEVICE), [END_A, END_B], [0, 1]
++    )
++    assert torch.isneginf(out[0, [1, 2]]).all()
++    assert (out[1] == 0).all()

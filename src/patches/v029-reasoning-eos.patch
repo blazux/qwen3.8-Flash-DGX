@@ -1,0 +1,611 @@
+diff --git a/vllm/config/reasoning.py b/vllm/config/reasoning.py
+index 0ac93be..dfd9b89 100644
+--- a/vllm/config/reasoning.py
++++ b/vllm/config/reasoning.py
+@@ -25,6 +25,22 @@ class ReasoningConfig:
+     """String that indicates the start of reasoning."""
+     reasoning_end_str: str = ""
+     """String forced when the thinking budget is exhausted."""
++    suppress_eos_in_reasoning: bool = False
++    """Suppress model EOS tokens while reasoning is open, without forcing an end.
++
++    Opt-in recovery for premature EOS. The request's output limit still applies.
++    """
++
++    _eos_token_ids: list[int] = field(default_factory=list, init=False, repr=False)
++    """Model EOS IDs suppressed while the guard is active."""
++    _tool_start_token_id: int | None = field(default=None, init=False, repr=False)
++    """Qwen tool opener whose function header must be validated."""
++    _tool_end_token_id: int | None = field(default=None, init=False, repr=False)
++    """Qwen tool closer; also closes an empty wrapper."""
++    _tool_preamble_token_texts: dict[int, str] = field(
++        default_factory=dict, init=False, repr=False
++    )
++    """Token text needed to recognize a Qwen function header after a tool opener."""
+ 
+     _reasoning_start_token_ids: list[int] | None = field(
+         default=None, init=False, repr=False
+@@ -77,6 +93,26 @@ class ReasoningConfig:
+             return  # Already initialized
+ 
+         tokenizer = cached_tokenizer_from_config(model_config=model_config)
++        if self.suppress_eos_in_reasoning:
++            eos_ids = model_config.try_get_generation_config().get("eos_token_id", [])
++            if isinstance(eos_ids, int):
++                eos_ids = [eos_ids]
++            self._eos_token_ids = list(eos_ids or [])
++            if tokenizer.eos_token_id is not None:
++                self._eos_token_ids.append(tokenizer.eos_token_id)
++            self._eos_token_ids = sorted(set(self._eos_token_ids))
++            if self.reasoning_parser == "qwen3":
++                vocab = tokenizer.get_vocab()
++                self._tool_start_token_id = vocab.get("<tool_call>")
++                self._tool_end_token_id = vocab.get("</tool_call>")
++                if self._tool_start_token_id is not None:
++                    prefix = "<function="
++                    suffixes = tuple(prefix[i:] for i in range(len(prefix)))
++                    for token_id in vocab.values():
++                        text = tokenizer.decode([token_id], skip_special_tokens=False)
++                        part = text.lstrip()
++                        if not part or part in prefix or part.startswith(suffixes):
++                            self._tool_preamble_token_texts[token_id] = text
+         reasoning_start_str = self.reasoning_start_str
+         reasoning_end_str = self.reasoning_end_str
+         natural_reasoning_end_str = ""
+@@ -98,6 +134,10 @@ class ReasoningConfig:
+             natural_reasoning_end_str = reasoning_end_str
+ 
+         if not reasoning_start_str or not reasoning_end_str:
++            if self.suppress_eos_in_reasoning:
++                raise ValueError(
++                    "suppress_eos_in_reasoning requires reasoning start/end markers"
++                )
+             # If we don't have valid strings to tokenize,
+             # we can't initialize the token IDs.
+             return
+diff --git a/vllm/v1/sample/thinking_budget_state.py b/vllm/v1/sample/thinking_budget_state.py
+index 43880bf..ba9f02b 100644
+--- a/vllm/v1/sample/thinking_budget_state.py
++++ b/vllm/v1/sample/thinking_budget_state.py
+@@ -63,6 +63,19 @@ class ThinkingBudgetStateHolder:
+             self.think_end_token_ids = re if re else []
+ 
+         self.device = device
++        self.suppress_eos = bool(
++            getattr(reasoning_config, "suppress_eos_in_reasoning", False)
++        )
++        self.eos_token_ids = getattr(reasoning_config, "_eos_token_ids", [])
++        self.natural_end_ids = (
++            getattr(reasoning_config, "natural_reasoning_end_token_ids", None)
++            or self.think_end_token_ids
++        )
++        self.tool_start_id = getattr(reasoning_config, "_tool_start_token_id", None)
++        self.tool_end_id = getattr(reasoning_config, "_tool_end_token_id", None)
++        self.tool_preamble_texts = getattr(
++            reasoning_config, "_tool_preamble_token_texts", {}
++        )
+         self._state: dict[int, dict[str, Any]] = {}
+         self.cu_num_tokens: dict[int, int] = {}
+ 
+@@ -72,7 +85,7 @@ class ThinkingBudgetStateHolder:
+             self._mask_capacity = max_num_reqs
+ 
+     def has_tracked_requests(self) -> bool:
+-        """True when ``sync_batch`` has state for a ``thinking_token_budget`` row.
++        """True when a row needs thinking-budget or EOS-guard state.
+ 
+         Used to decide whether sampling needs output-token rows and spec combining;
+         distinct from merely having a holder instance (reasoning may be on with no
+@@ -89,12 +102,29 @@ class ThinkingBudgetStateHolder:
+ 
+         for index, params, prompt_tok_ids, output_tok_ids in batch_update.added:
+             thinking_token_budget = params.thinking_token_budget
+-            if thinking_token_budget is not None:
++            guard_enabled = self.suppress_eos and not params.ignore_eos
++            if thinking_token_budget is not None or guard_enabled:
+                 self._state[index] = self._init_state_entry(
+-                    prompt_tok_ids, thinking_token_budget
++                    prompt_tok_ids,
++                    thinking_token_budget if thinking_token_budget is not None else -1,
+                 )
+                 self._state[index]["output_tok_ids"] = output_tok_ids
+                 self._state[index]["spec_token_ids"] = []
++                guard_state = self._state[index]
++                guard_state["eos_guard_enabled"] = guard_enabled
++                guard_state["eos_guard_in_think"] = False
++                guard_state["eos_guard_tail"] = []
++                guard_state["eos_guard_preamble"] = None
++                guard_state["eos_guard_offset"] = 0
++                if guard_enabled:
++                    active, tail, preamble = self._advance_eos_guard(
++                        False, [], prompt_tok_ids or []
++                    )
++                    guard_state["eos_guard_in_think"] = active
++                    guard_state["eos_guard_tail"] = tail
++                    guard_state["eos_guard_preamble"] = preamble
++                    if thinking_token_budget is None:
++                        guard_state["in_end"] = False
+             else:
+                 self._state.pop(index, None)
+ 
+@@ -146,6 +176,18 @@ class ThinkingBudgetStateHolder:
+             state["in_spec_mode"] = self.in_spec_mode
+             state["force_index"] = []
+             self._update_think_state(state)
++            if state["eos_guard_enabled"]:
++                output_ids = state["output_tok_ids"]
++                active, tail, preamble = self._advance_eos_guard(
++                    state["eos_guard_in_think"],
++                    state["eos_guard_tail"],
++                    output_ids[state["eos_guard_offset"] :],
++                    state["eos_guard_preamble"],
++                )
++                state["eos_guard_in_think"] = active
++                state["eos_guard_tail"] = tail
++                state["eos_guard_preamble"] = preamble
++                state["eos_guard_offset"] = len(output_ids)
+ 
+     def apply_to_logits(
+         self,
+@@ -157,8 +199,92 @@ class ThinkingBudgetStateHolder:
+         if not self.is_enabled or not self._state:
+             return logits
+         spec_lists = spec_token_ids or []
++        if self.suppress_eos:
++            self._suppress_reasoning_eos(logits, predict_bonus_token, spec_lists)
+         return self._apply_forcing_to_logits(logits, predict_bonus_token, spec_lists)
+ 
++    def _advance_eos_guard(
++        self,
++        active: bool,
++        tail: list[int],
++        token_ids: list[int],
++        preamble: str | None = None,
++    ) -> tuple[bool, list[int], str | None]:
++        tail = list(tail)
++        width = max(len(self.think_start_token_ids), len(self.natural_end_ids), 1)
++        for token_id in token_ids:
++            tail.append(token_id)
++            tail = tail[-width:]
++            if self.think_start_token_ids and (
++                tail[-len(self.think_start_token_ids) :] == self.think_start_token_ids
++            ):
++                active = True
++                preamble = None
++            elif self.natural_end_ids and (
++                tail[-len(self.natural_end_ids) :] == self.natural_end_ids
++            ):
++                active = False
++                preamble = None
++            elif active and token_id == self.tool_start_id:
++                preamble = ""
++            elif active and preamble is not None:
++                if token_id == self.tool_end_id:
++                    active = False
++                    preamble = None
++                    continue
++                text = self.tool_preamble_texts.get(token_id)
++                if text is None:
++                    preamble = None
++                    continue
++                candidate = (preamble + text).lstrip()
++                if candidate.startswith("<function="):
++                    active = False
++                    preamble = None
++                elif "<function=".startswith(candidate):
++                    preamble = candidate
++                else:
++                    preamble = None
++        return active, tail, preamble
++
++    def _suppress_reasoning_eos(
++        self,
++        logits: torch.Tensor,
++        predict_bonus_token: bool,
++        spec_lists: list[list[int]],
++    ) -> None:
++        rows: list[int] = []
++        tokens: list[int] = []
++        offset = 0
++        n_reqs = max(len(spec_lists), max(self._state, default=-1) + 1)
++        for index in range(n_reqs):
++            draft = spec_lists[index] if index < len(spec_lists) else []
++            count = len(draft) if self.in_spec_mode and not predict_bonus_token else 1
++            state = self._state.get(index)
++            if state is not None and state["eos_guard_enabled"]:
++                active = state["eos_guard_in_think"]
++                tail = state["eos_guard_tail"]
++                preamble = state["eos_guard_preamble"]
++                if predict_bonus_token:
++                    active, tail, preamble = self._advance_eos_guard(
++                        active, tail, draft, preamble
++                    )
++                for position in range(count):
++                    if active and offset + position < logits.shape[0]:
++                        for token_id in self.eos_token_ids:
++                            rows.append(offset + position)
++                            tokens.append(token_id)
++                    if not predict_bonus_token and draft:
++                        active, tail, preamble = self._advance_eos_guard(
++                            active, tail, [draft[position]], preamble
++                        )
++            offset += count
++        if rows:
++            row_indices = async_tensor_h2d(rows, dtype=torch.long, device=logits.device)
++            token_indices = async_tensor_h2d(
++                tokens, dtype=torch.long, device=logits.device
++            )
++            logits[row_indices, token_indices] = -float("inf")
++
+     @staticmethod
+     def _find_last_sequence_index(target_list: list[int], token_ids: list[int]) -> int:
+         if not token_ids:
+diff --git a/vllm/v1/worker/gpu/sample/reasoning_eos.py b/vllm/v1/worker/gpu/sample/reasoning_eos.py
+new file mode 100644
+index 0000000..7fc8a25
+--- /dev/null
++++ b/vllm/v1/worker/gpu/sample/reasoning_eos.py
+@@ -0,0 +1,302 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Incremental reasoning EOS masking for Model Runner V2."""
++
++import numpy as np
++import torch
++
++from vllm.config.reasoning import ReasoningConfig
++from vllm.sampling_params import SamplingParams
++from vllm.triton_utils import tl, triton
++from vllm.utils.torch_utils import async_tensor_h2d
++from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
++from vllm.v1.worker.gpu.sample.thinking_budget import _load_effective_token
++from vllm.v1.worker.gpu.states import RequestState
++
++
++class ReasoningEOSState:
++    def __init__(self, req_states: RequestState, config: ReasoningConfig | None):
++        self.req_states = req_states
++        self.enabled = bool(getattr(config, "suppress_eos_in_reasoning", False))
++        self.use_guard = np.zeros(req_states.max_num_reqs, dtype=bool)
++        if not self.enabled:
++            return
++        assert config is not None
++        self.start_ids = torch.tensor(
++            config.reasoning_start_token_ids,
++            dtype=torch.int32,
++            device=req_states.device,
++        )
++        self.end_ids = torch.tensor(
++            config.natural_reasoning_end_token_ids,
++            dtype=torch.int32,
++            device=req_states.device,
++        )
++        self.eos_ids = torch.tensor(
++            config._eos_token_ids, dtype=torch.int32, device=req_states.device
++        )
++        self.tool_start = config._tool_start_token_id
++        self.tool_end = config._tool_end_token_id
++        prefix = "<function="
++        # 0: content, 1: reasoning, 2 + n: a tool opener followed by n prefix chars.
++        transitions = np.ones((len(prefix), req_states.vocab_size), dtype=np.int8)
++        for n in range(len(prefix)):
++            for token_id, text in config._tool_preamble_token_texts.items():
++                candidate = (prefix[:n] + text).lstrip()
++                if candidate.startswith(prefix):
++                    transitions[n, token_id] = 0
++                elif prefix.startswith(candidate):
++                    transitions[n, token_id] = 2 + len(candidate)
++        self.transitions = torch.tensor(transitions, device=req_states.device)
++        self.guard_enabled = UvaBackedTensor(req_states.max_num_reqs, dtype=torch.int32)
++        self.guard_enabled.np.fill(0)
++        self.guard_enabled.copy_to_uva()
++        self.phase = torch.zeros(
++            req_states.max_num_reqs, dtype=torch.int32, device=req_states.device
++        )
++        self.scan_pos = torch.zeros_like(self.phase)
++        self._reset_reqs: list[int] = []
++
++    def add_request(self, req_idx: int, params: SamplingParams) -> None:
++        if not self.enabled:
++            return
++        self.use_guard[req_idx] = not params.ignore_eos
++        self.guard_enabled.np[req_idx] = int(not params.ignore_eos)
++        self._reset_reqs.append(req_idx)
++
++    def apply_staged_writes(self) -> None:
++        if not self.enabled or not self._reset_reqs:
++            return
++        ids = async_tensor_h2d(
++            self._reset_reqs, dtype=torch.int64, device=self.req_states.device
++        )
++        self.phase.index_fill_(0, ids, 0)
++        self.scan_pos.index_fill_(0, ids, 0)
++        self.guard_enabled.copy_to_uva()
++        self._reset_reqs.clear()
++
++    def apply(
++        self,
++        logits,
++        expanded_idx_mapping,
++        idx_mapping,
++        idx_mapping_np,
++        input_ids,
++        expanded_local_pos,
++    ) -> None:
++        if not self.enabled or not np.any(self.use_guard[idx_mapping_np]):
++            return
++        shared = (
++            self.guard_enabled.gpu,
++            self.req_states.all_token_ids.gpu,
++            self.req_states.all_token_ids.gpu.stride(0),
++            self.req_states.total_len.gpu,
++            self.phase,
++            self.scan_pos,
++            self.start_ids,
++            self.end_ids,
++            self.transitions,
++        )
++        options = dict(
++            START_LEN=self.start_ids.numel(),
++            END_LEN=self.end_ids.numel(),
++            VOCAB=self.req_states.vocab_size,
++            TOOL_START=-1 if self.tool_start is None else self.tool_start,
++            TOOL_END=-1 if self.tool_end is None else self.tool_end,
++        )
++        _update_committed_phase[(idx_mapping.numel(),)](idx_mapping, *shared, **options)
++        _mask_reasoning_eos[(logits.shape[0],)](
++            logits,
++            logits.stride(0),
++            expanded_idx_mapping,
++            input_ids,
++            expanded_local_pos,
++            self.eos_ids,
++            *shared,
++            EOS_COUNT=self.eos_ids.numel(),
++            **options,
++        )
++
++
++@triton.jit
++def _advance_phase(
++    phase,
++    pos,
++    all_ids,
++    stride,
++    input_ids,
++    first,
++    req,
++    total,
++    start_ids,
++    end_ids,
++    transitions,
++    START_LEN: tl.constexpr,
++    END_LEN: tl.constexpr,
++    VOCAB: tl.constexpr,
++    TOOL_START: tl.constexpr,
++    TOOL_END: tl.constexpr,
++):
++    start_match = pos + 1 >= START_LEN
++    for j in tl.static_range(0, START_LEN):
++        if pos + 1 >= START_LEN:
++            actual = _load_effective_token(
++                all_ids, stride, input_ids, first, req, total, pos + 1 - START_LEN + j
++            )
++            start_match = start_match & (actual == tl.load(start_ids + j))
++    end_match = pos + 1 >= END_LEN
++    for j in tl.static_range(0, END_LEN):
++        if pos + 1 >= END_LEN:
++            actual = _load_effective_token(
++                all_ids, stride, input_ids, first, req, total, pos + 1 - END_LEN + j
++            )
++            end_match = end_match & (actual == tl.load(end_ids + j))
++    token = _load_effective_token(all_ids, stride, input_ids, first, req, total, pos)
++    if start_match:
++        phase = 1
++    elif end_match:
++        phase = 0
++    elif phase > 0 and token == TOOL_START:
++        phase = 2
++    elif phase >= 2:
++        if token == TOOL_END:
++            phase = 0
++        else:
++            phase = tl.load(transitions + (phase - 2) * VOCAB + token).to(tl.int32)
++    return phase
++
++
++@triton.jit
++def _update_committed_phase(
++    req_ids,
++    enabled,
++    all_ids,
++    stride,
++    total_lens,
++    phases,
++    scan_positions,
++    start_ids,
++    end_ids,
++    transitions,
++    START_LEN: tl.constexpr,
++    END_LEN: tl.constexpr,
++    VOCAB: tl.constexpr,
++    TOOL_START: tl.constexpr,
++    TOOL_END: tl.constexpr,
++    BLOCK: tl.constexpr = 1024,
++):
++    req = tl.load(req_ids + tl.program_id(0))
++    if tl.load(enabled + req) == 0:
++        return
++    total = tl.load(total_lens + req)
++    scan = tl.load(scan_positions + req)
++    phase = tl.load(phases + req)
++    if scan == 0 or scan > total:
++        # Most prompts end in a reasoning marker. Find the latest marker in
++        # parallel blocks, then inspect only the following tool preamble/text.
++        last_start = -1
++        last_end = -1
++        hi = total
++        while hi > 0 and last_start < 0 and last_end < 0:
++            lo = tl.maximum(0, hi - BLOCK)
++            offs = lo + tl.arange(0, BLOCK)
++            sm = (offs < hi) & (offs + START_LEN <= total)
++            em = (offs < hi) & (offs + END_LEN <= total)
++            for j in tl.static_range(0, START_LEN):
++                token = tl.load(
++                    all_ids + req * stride + offs + j, mask=offs + j < total, other=-1
++                )
++                sm = sm & (token == tl.load(start_ids + j))
++            for j in tl.static_range(0, END_LEN):
++                token = tl.load(
++                    all_ids + req * stride + offs + j, mask=offs + j < total, other=-1
++                )
++                em = em & (token == tl.load(end_ids + j))
++            last_start = tl.max(tl.where(sm, offs, -1), axis=0)
++            last_end = tl.max(tl.where(em, offs, -1), axis=0)
++            hi = lo
++        phase = tl.where(last_start > last_end, 1, 0)
++        scan = tl.where(
++            last_start > last_end,
++            last_start + START_LEN,
++            tl.where(last_end >= 0, last_end + END_LEN, total),
++        )
++    for pos in tl.range(scan, total):
++        phase = _advance_phase(
++            phase,
++            pos,
++            all_ids,
++            stride,
++            all_ids,
++            0,
++            req,
++            total,
++            start_ids,
++            end_ids,
++            transitions,
++            START_LEN,
++            END_LEN,
++            VOCAB,
++            TOOL_START,
++            TOOL_END,
++        )
++    tl.store(phases + req, phase)
++    tl.store(scan_positions + req, total)
++
++
++@triton.jit
++def _mask_reasoning_eos(
++    logits,
++    logits_stride,
++    expanded_req_ids,
++    input_ids,
++    local_positions,
++    eos_ids,
++    enabled,
++    all_ids,
++    stride,
++    total_lens,
++    phases,
++    scan_positions,
++    start_ids,
++    end_ids,
++    transitions,
++    EOS_COUNT: tl.constexpr,
++    START_LEN: tl.constexpr,
++    END_LEN: tl.constexpr,
++    VOCAB: tl.constexpr,
++    TOOL_START: tl.constexpr,
++    TOOL_END: tl.constexpr,
++):
++    row = tl.program_id(0)
++    req = tl.load(expanded_req_ids + row)
++    if tl.load(enabled + req) == 0:
++        return
++    total = tl.load(total_lens + req)
++    local_pos = tl.load(local_positions + row)
++    phase = tl.load(phases + req)
++    first = row - local_pos
++    # Draft prefixes affect only this row, never the committed phase cache.
++    for pos in tl.range(total, total + local_pos):
++        phase = _advance_phase(
++            phase,
++            pos,
++            all_ids,
++            stride,
++            input_ids,
++            first,
++            req,
++            total,
++            start_ids,
++            end_ids,
++            transitions,
++            START_LEN,
++            END_LEN,
++            VOCAB,
++            TOOL_START,
++            TOOL_END,
++        )
++    if phase > 0:
++        for i in tl.static_range(0, EOS_COUNT):
++            eos = tl.load(eos_ids + i)
++            tl.store(logits + row * logits_stride + eos, -float("inf"))
+diff --git a/vllm/v1/worker/gpu/sample/sampler.py b/vllm/v1/worker/gpu/sample/sampler.py
+index 3ee2c13..a581a7b 100644
+--- a/vllm/v1/worker/gpu/sample/sampler.py
++++ b/vllm/v1/worker/gpu/sample/sampler.py
+@@ -24,6 +24,7 @@ from vllm.v1.worker.gpu.sample.logprob import (
+ )
+ from vllm.v1.worker.gpu.sample.output import SamplerOutput, SamplingMaskTensors
+ from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
++from vllm.v1.worker.gpu.sample.reasoning_eos import ReasoningEOSState
+ from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS, SamplingStates
+ from vllm.v1.worker.gpu.sample.thinking_budget import ThinkingBudgetState
+ from vllm.v1.worker.gpu.sample.trace_replay import TraceReplayState
+@@ -55,6 +56,7 @@ class Sampler:
+         self.bad_words_state = BadWordsState(req_states)
+         self.logprob_token_ids_state = LogprobTokenIdsState(max_num_reqs, device)
+         self.thinking_budget_state = ThinkingBudgetState(req_states, reasoning_config)
++        self.reasoning_eos_state = ReasoningEOSState(req_states, reasoning_config)
+         self.trace_replay_state = (
+             TraceReplayState(req_states) if enable_trace_replay else None
+         )
+@@ -74,13 +76,15 @@ class Sampler:
+         self.bad_words_state.add_request(req_idx, sampling_params)
+         self.logprob_token_ids_state.add_request(req_idx, sampling_params)
+         self.thinking_budget_state.add_request(req_idx, sampling_params)
++        self.reasoning_eos_state.add_request(req_idx, sampling_params)
+         if self.trace_replay_state is not None:
+             self.trace_replay_state.add_request(req_idx, sampling_params)
+ 
+         states = self.sampling_states
+         temperature = states.temperature.np[req_idx]
+         self.needs_logits_processing[req_idx] = (
+-            self.logit_bias_state.use_logit_bias[req_idx]
++            self.reasoning_eos_state.use_guard[req_idx]
++            or self.logit_bias_state.use_logit_bias[req_idx]
+             or self.penalties_state.use_penalty[req_idx]
+             or self.bad_words_state.num_bad_words.np[req_idx] > 0
+             or (
+@@ -100,6 +104,7 @@ class Sampler:
+         self.bad_words_state.apply_staged_writes()
+         self.logprob_token_ids_state.apply_staged_writes()
+         self.thinking_budget_state.apply_staged_writes()
++        self.reasoning_eos_state.apply_staged_writes()
+         if self.trace_replay_state is not None:
+             self.trace_replay_state.apply_staged_writes()
+ 
+@@ -244,6 +249,15 @@ class Sampler:
+             expanded_local_pos,
+         )
+ 
++        self.reasoning_eos_state.apply(
++            logits,
++            expanded_idx_mapping,
++            idx_mapping,
++            idx_mapping_np,
++            input_ids,
++            expanded_local_pos,
++        )
++
+         # Force the reasoning end marker once a request's thinking budget is
+         # reached; applied before temperature so the forced token is always kept.
+         self.thinking_budget_state.apply(

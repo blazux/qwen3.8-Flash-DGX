@@ -66,3 +66,14 @@ RUN cd /opt/llm/kernel-det/src && DET_BUILD_DIR=/opt/llm/kernel-det/build DET_AR
 COPY src/patch_mtp_draft_vocab.py /tmp/patch_mtp_draft_vocab.py
 COPY src/draft_vocab_65536.npy /opt/llm/draft_vocab_65536.npy
 RUN python3 /tmp/patch_mtp_draft_vocab.py ${PKG}/mtp.py && rm /tmp/patch_mtp_draft_vocab.py
+
+
+# --- 11. Lossless Qwen tool preambles + optional reasoning EOS guard ---
+# Covers both Model Runner V1 and the v0.29 default V2 sampler. The guard is
+# enabled only by --reasoning-config.suppress_eos_in_reasoning=true.
+COPY src/patches/v029-qwen-tool-preamble.patch /tmp/qwen-tool-preamble.patch
+COPY src/patches/v029-reasoning-eos.patch /tmp/qwen-reasoning-eos.patch
+RUN cd ${SP} \
+ && patch --batch --forward --fuzz=0 -p1 < /tmp/qwen-tool-preamble.patch \
+ && patch --batch --forward --fuzz=0 -p1 < /tmp/qwen-reasoning-eos.patch \
+ && rm /tmp/qwen-tool-preamble.patch /tmp/qwen-reasoning-eos.patch

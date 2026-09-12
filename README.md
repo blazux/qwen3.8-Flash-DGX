@@ -37,7 +37,7 @@ be overridden on the command line (`./flash serve default MTP=3 PORT=18301`). `.
 The same thing by hand, unchanged and still supported (everything `flash` does is these scripts):
 
 ```bash
-docker build -t qwen38-flash-dgx .            # ~1 min: official vLLM image + the 10 patches below
+docker build -t qwen38-flash-dgx .            # ~1 min: official vLLM image + the 11 patches below
 scripts/download-weights.sh                   # RadixArk NVFP4 checkpoint, ~126 GiB, resumable (one-time)
 scripts/prepare-hybrid.sh                     # recommended: fp8 side layers, +20% decode, same quality (~10 min, one-time)
 MODE=hybrid YARN=1 CTX=500000 scripts/serve.sh   # the recipe our own box runs; 500k context, ~13 min to load
@@ -61,6 +61,27 @@ Everything below is the long version: what was broken on GB10, what was fixed, a
 > [@jschmied](https://github.com/jschmied) — see
 > [issue #1](https://github.com/blazux/qwen3.8-Flash-DGX/issues/1) and their
 > [write-up](https://github.com/jschmied/qwen38-flash-next-gb10).
+
+## Quoted tool markers
+
+Both image recipes include a parser fix for literal or malformed `<tool_call>`
+markers in Qwen reasoning and ordinary text. Previously, quoting that marker could
+switch the parser into a tool preamble and discard subsequent text, including a
+final answer after `</think>`. The parser now buffers the marker and preserves it as text when ordinary prose
+follows, while recognizing a function-header prefix (`<function=`) as a tool call.
+Valid calls and existing empty-wrapper/end-of-stream handling are retained.
+The fix is enabled for the `qwen3` parser; derived parser configurations retain
+their existing behavior.
+
+The regression patch extends vLLM's existing Qwen parser tests. To run it from a
+matching vLLM source checkout with its test dependencies installed (using absolute
+paths to this repository's patch files):
+
+```bash
+patch --batch --forward --fuzz=0 -p1 < /path/to/qwen3.8-Flash-DGX/src/patches/qwen-tool-preamble.patch
+patch --batch --forward --fuzz=0 -p1 < /path/to/qwen3.8-Flash-DGX/src/patches/qwen-tool-preamble-tests.patch
+.venv/bin/python -m pytest tests/parser/engine -q
+```
 
 ## Update 2026-09-11 — what changed
 

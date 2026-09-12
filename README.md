@@ -566,10 +566,11 @@ original reasoning/content channel. Whitespace followed by a valid `<function=`
 header continues to start a tool call. A malformed opener does not disable the
 EOS guard.
 
-This changes generation only when EOS would otherwise end an open reasoning
-section, so answer quality still needs workload evaluation. EOS in final-answer
-text remains a protocol terminator: this option does not make literal special
-tokens safe to quote everywhere. The preview image does not carry these patches.
+While reasoning is open, removing EOS changes the sampling distribution and can
+change the generated tokens; answer quality still needs workload evaluation.
+EOS in final-answer text remains a protocol terminator: this option does not
+make literal special tokens safe to quote everywhere. The preview image does
+not carry these patches.
 
 The regression patch in `src/patches/v029-reasoning-regressions.patch` applies to
 a vLLM `v0.29.0` source checkout. Apply the two runtime patches there as well and

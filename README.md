@@ -568,6 +568,8 @@ EOS guard.
 
 While reasoning is open, removing EOS changes the sampling distribution and can
 change the generated tokens; answer quality still needs workload evaluation.
+Reasoning can still exhaust the requested output budget without producing a
+final answer.
 EOS in final-answer text remains a protocol terminator: this option does not
 make literal special tokens safe to quote everywhere. The preview image does
 not carry these patches.

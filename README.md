@@ -22,6 +22,21 @@ kernel that drops candidates) — and offers an optional **hybrid** checkpoint l
 
 ```bash
 git clone https://github.com/blazux/qwen3.8-Flash-DGX.git && cd qwen3.8-Flash-DGX
+./flash doctor      # docker, GPU, memory, disk, port, image, weights: tells you what is missing
+./flash setup       # builds the image, downloads the checkpoint (126 GiB, resumable), prepares the hybrid layout
+./flash serve       # the recommended recipe (profile "default"): hybrid, 500k context, deterministic
+./flash wait        # first boot loads ~76 GiB of weights, 8-13 min; prints the KV pool when the API is up
+./flash test        # health, coherence, prefix-cache hit, determinism, tok/s
+```
+
+Other recipes are one word away: `./flash profiles` lists them (`speed`, `context`, `context-1m`,
+`shared`, `published`, `native`, `v0.29`), `./flash serve speed` runs one, and any variable can still
+be overridden on the command line (`./flash serve default MTP=3 PORT=18301`). `./flash status`,
+`logs`, `stop`, `start`, `rm` do what they say. Details in [The `flash` command](#the-flash-command).
+
+The same thing by hand, unchanged and still supported (everything `flash` does is these scripts):
+
+```bash
 docker build -t qwen38-flash-dgx .            # ~1 min: official vLLM image + the 10 patches below
 scripts/download-weights.sh                   # RadixArk NVFP4 checkpoint, ~126 GiB, resumable (one-time)
 scripts/prepare-hybrid.sh                     # recommended: fp8 side layers, +20% decode, same quality (~10 min, one-time)
@@ -50,6 +65,16 @@ Everything below is the long version: what was broken on GB10, what was fixed, a
 ## Update 2026-09-11 — what changed
 
 Newest first. If you cloned this before, this is the short version; details in the linked sections.
+
+**2026-09-12** — one command for newcomers, nothing removed for everyone else:
+
+- **`./flash`** — `doctor`, `setup`, `serve <profile>`, `wait`, `test`, `status`, `logs`, `stop`, `start`,
+  `rm`. It is a thin front-end over the existing scripts: a profile is a plain env file in `profiles/`
+  holding the `serve.sh` variables for one recipe (`default`, `speed`, `context`, `context-1m`, `shared`,
+  `published`, `native`, `v0.29`), `setup` runs the build / download / prepare steps only when they are
+  not done yet, `doctor` checks the box before you spend an hour downloading. **The scripts and every
+  `MODE=… scripts/serve.sh` command in this README keep working exactly as before**; if you already have
+  a working setup there is nothing to change. → [The `flash` command](#the-flash-command)
 
 **2026-09-11** — the recipe runs on the vLLM **v0.29.0** release too:
 
@@ -201,6 +226,38 @@ one wins; anything below it stays an option.
 If your priority is raw throughput rather than the agent's reliability, the fast profile is
 `MODE=hybrid MTP=3` (41 tok/s in the tournament against 38.5 for the default), and
 `MODE=hybrid-mtp` on top if you need the KV pool more than the last few percent of quality.
+
+## The `flash` command
+
+`./flash` is the short path. It does not replace the scripts; it calls them with a named set of
+variables, checks what is already done, and tells you what is missing.
+
+| command | what it does |
+|---|---|
+| `./flash doctor [profile]` | checks arm64/GB10, the 128 GB pool and how much of it is free right now (vLLM needs `GPU_MEM` × total *free* to boot), docker + nvidia runtime, other running containers, the port, the image and its base label, the checkpoint, the prepared layouts, disk space for what is still to download, and the profile itself (YaRN vs context, fp8 KV on the right base) |
+| `./flash setup [profile]` | build the image the profile expects (`Dockerfile` or `Dockerfile.v0.29`), download the weights, prepare the hybrid layout and the MTP graft — each step skipped when already done, so re-running it is free |
+| `./flash serve [profile] [KEY=VALUE…]` | loads the profile, applies your overrides, refuses early if something is missing, then `exec`s `scripts/serve.sh` |
+| `./flash wait` | polls the container and the API, shows the loading stage, prints the KV pool when up |
+| `./flash test` | `scripts/smoke-test.sh` against the running server |
+| `./flash status` / `logs` / `stop` / `start` / `rm` | the container's state, KV pool, active patches, running requests and prefix-cache hit rate; follow the log; stop (kept, `start` reloads in 8-13 min); remove |
+| `./flash profiles` | the list below |
+
+Profiles (`profiles/*.env`, each a handful of `serve.sh` variables; copy one to make your own):
+
+| profile | recipe | when |
+|---|---|---|
+| `default` | hybrid, YaRN 500k, deterministic top-k, reduced draft vocabulary, prefix caching, MTP=2 | the recommended one: best tournament score (45/51) |
+| `speed` | default + `MTP=3` | +7% decode for about one tournament point |
+| `context` | `MODE=hybrid-mtp` (NVFP4 MTP draft experts) | +22% KV pool for concurrency or long contexts, decode unchanged |
+| `context-1m` | hybrid + `KV_DTYPE=fp8_e4m3`, 1M context | when you need 1M tokens in one request (speed and some quality cost; preview base only) |
+| `shared` | default + `--long-prefill-token-threshold 1024` | several clients at once: decoding stays responsive while others prefill, single-stream TTFT −17–36% |
+| `published` | `MODE=nvfp4`, YaRN 500k | the checkpoint exactly as published, nothing to prepare; ~26 tok/s |
+| `native` | hybrid, 262k, no YaRN | if you never go past the native context |
+| `v0.29` | default recipe on the vLLM v0.29.0 release image | to be on the release line (`Dockerfile.v0.29`, measured at parity) |
+
+Precedence: a variable already in your environment beats the profile (`PORT=18301 ./flash serve`
+works like the plain scripts), and `KEY=VALUE` arguments beat both. Container name and port default
+to `qwen38-flash` and `18300`, like `serve.sh`.
 
 ## Requirements
 
@@ -649,6 +706,8 @@ Details: [results-radixark-vllm.md](https://github.com/jschmied/qwen38-flash-nex
 ## What's in here
 
 ```
+flash                             one-command front-end: doctor / setup / serve <profile> / wait / test / status …
+profiles/*.env                    named recipes for it (default, speed, context, context-1m, shared, published, native, v0.29)
 Dockerfile                        official vLLM Flash-Next preview image + the patches below (default)
 Dockerfile.v0.29                  same recipe on the vLLM v0.29.0 release (patches 3 and 9 dropped, 7 not ported)
 src/vllm_ple_mmap.py              1. mmap PLE table (opaque splitting op)            VLLM_PLE_MMAP=1

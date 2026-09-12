@@ -542,7 +542,7 @@ compile is on (≈28 s at boot); graphs stay PIECEWISE for the reason in
 
 | | preview image | v0.29 base |
 |---|---|---|
-| KV pool | ~630k tokens | 575,757–578,787 tokens (the release reserves more during profiling) |
+| KV pool | 565k–630k tokens (the same recipe, boot to boot: the profiler's headroom depends on the page-cache state) | 575,757–578,787 tokens (two boots) |
 | Determinism (4 prompts × repeats, temperature 0) | 4/4 | 4/4 |
 | Decode, single stream, median of 6 | ~37 tok/s | 36.4 tok/s (33.8–41.5) |
 | Prefill warm, 8k / 32k | ~2,500–3,000 tok/s | 2,529 / 3,026 tok/s |
@@ -555,7 +555,7 @@ Run 2 fails exactly the scenarios the preview image fails (`b6_reconcile`,
 `c5_inventory_reconcile`, which every quantization we tried fails). Run 1's deficit is two
 reasoning runaways that hit the token cap, which we see in roughly one run in three on any
 configuration; it is the day-to-day variance of this benchmark, not a property of the base.
-Verdict: parity in quality and speed, −8% KV and −3 points of draft acceptance that we have
+Verdict: parity in quality, speed and KV pool, and −3 points of draft acceptance that we have
 not investigated. The preview `Dockerfile` stays the default and our production image for
 now; `Dockerfile.v0.29` is the tested path onto the release line, and will become the
 default once fp8 KV is ported and it has run in production for a while.

@@ -62,7 +62,8 @@ Newest first. If you cloned this before, this is the short version; details in t
   mmap patch was rewritten for the new layer. **Measured at parity** on the tournament
   (45/51 at 38.7 tok/s vs 45/51 at 38.5 on the preview image, same two scenarios failed; a
   first run gave 42.5/51 with two reasoning runaways, within the usual variance), decode
-  36.4 tok/s, prefill 2,529–3,026 tok/s, KV ~580k tokens (−8%, the release reserves more).
+  36.4 tok/s, prefill 2,529–3,026 tok/s, KV pool in the same range (~577k; the same recipe on the
+  preview image boots anywhere between 565k and 630k depending on the page-cache state at profiling).
   `scripts/serve.sh` reads the base from an image label and adjusts the splitting ops.
   Not ported yet: the fp8 KV cache (patch 7). The preview `Dockerfile` stays the default
   until the v0.29 base has more field time. → [vLLM v0.29.0 as the base image](#vllm-v0290-as-the-base-image-dockerfilev029)
@@ -477,14 +478,14 @@ Measured on our GX10, hybrid, the default recipe, YaRN 500k, same day as the pre
 | Prefill, cold table region | | 2,513 (8k) / 2,447 (32k) tok/s |
 | Needle at 92k | ~45 s | 45.4 s |
 | MTP acceptance (reduced vocabulary) | ~68% | 64.8% |
-| KV pool @0.80 | ~630k tokens | ~577k tokens |
+| KV pool @0.80 | 565k–630k tokens (varies with the page-cache state at profiling) | ~577k tokens (two boots) |
 | Deterministic at temperature 0 / prefix-cache hit bit-exact | yes / yes | yes (4/4) / yes (log-prob delta 0.0000) |
 
 The two tournament runs fail exactly the same scenarios as the preview image (the two that
 every quantization we tried fails); the 42.5 of the first run is two `length` finishes, the
 reasoning runaways we see in about one run out of three on any configuration. So: parity,
-with a slightly smaller KV pool and slightly lower draft acceptance, both of which we have
-not chased yet. **The preview `Dockerfile` remains the default** until this base has more
+with a slightly lower draft acceptance that we have not chased yet (the KV pool is within the
+boot-to-boot range of the preview image). **The preview `Dockerfile` remains the default** until this base has more
 field time on our own box; if you want to be on the release line, it is ready and tested.
 Full port notes in [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md#the-vllm-v0290-port-dockerfilev029).
 

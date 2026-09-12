@@ -404,11 +404,12 @@ _STATS = {"calls": 0, "op_ms": 0.0, "gather_ms": 0.0, "rows": 0, "bytes": 0}
 # cost depends on runtime state (page-cache residency) rather than on config, so
 # it is exactly the thing worth graphing.
 #
-# These live in the EngineCore process, not the API server. That is fine: vLLM
-# sets PROMETHEUS_MULTIPROC_DIR and collects through prometheus_client's
-# MultiProcessCollector, so counters registered here are aggregated into the
-# frontend's /metrics. They are created lazily on first use, because the env var
-# must be set before the first metric is constructed.
+# These live in the EngineCore process, not the API server, so they only reach the
+# frontend's /metrics when prometheus_client runs in multiprocess mode: the API
+# server's MultiProcessCollector then aggregates what every process writes under
+# PROMETHEUS_MULTIPROC_DIR. vLLM only turns that on for api_server_count > 1;
+# scripts/serve.sh sets it when PROM_MULTIPROC=1 (opt-in). They are created lazily on first use,
+# because the env var must be set before the first metric is constructed.
 #
 # Derived views worth having:
 #   rate(vllm:ple_mmap_op_seconds_total[5m])
@@ -430,6 +431,15 @@ def _prom() -> dict[str, object] | None:
     _PROM_TRIED = True
     if os.environ.get("VLLM_PLE_MMAP_PROMETHEUS", "1").lower() in ("0", "false", "no"):
         return None
+    if not os.environ.get("PROMETHEUS_MULTIPROC_DIR"):
+        # The default. vLLM only enables multiprocess metrics for api_server_count > 1,
+        # and exporting these costs vLLM its *_created samples, so it is opt-in: say how
+        # to turn it on rather than warn about the expected configuration.
+        logger.info(
+            "PLE mmap: PROMETHEUS_MULTIPROC_DIR is unset, so the vllm:ple_mmap_* counters "
+            "stay in this process and will not appear on /metrics while the engine runs "
+            "in its own process. scripts/serve.sh exports them with PROM_MULTIPROC=1."
+        )
     try:
         from prometheus_client import Counter
 

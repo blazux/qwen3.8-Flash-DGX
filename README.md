@@ -584,6 +584,7 @@ Full port notes in [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md#the-vllm-v0290-po
 | `PREWARM` | `0` | `1` streams the 48 GiB table once at boot to warm the page cache — steadier first-request latency, ~10 s extra startup. |
 | `WORKERS` | `32` | Threads used for the mmap gather (only used above `VLLM_PLE_MMAP_FAST_ROWS`=512 unique rows; decode-sized gathers run inline). |
 | `LOG_REQUESTS` | `0` | `1` logs every prompt and output (`VLLM_LOGGING_LEVEL=DEBUG --enable-log-requests --enable-log-outputs`) so `tools/vllm_watch.py` can show sessions live. Debugging only: it puts user content in the Docker log, unbounded. |
+| `PROM_MULTIPROC` | `0` | `1` runs prometheus_client in multiprocess mode so engine-side metrics (`vllm:ple_mmap_*`) reach `/metrics`. Opt-in, because it stops vLLM exporting its `*_created` samples; see *Watching the mmapped table* below. |
 | `KV_CACHE_MEM` | | Passed through as `--kv-cache-memory-bytes`. `GPU_MEM` is a fraction of *total* device memory, so it leaves whatever was already resident on the table; vLLM prints the exact figure it would accept at startup ("Replace gpu_memory_utilization config with `--kv-cache-memory=...`"). On a Spark that headroom is also what the page cache uses for the PLE table, so taking it is a trade, not free memory — watch `vllm:ple_mmap_gather_seconds_total` when you do. |
 | `EXTRA` | | Extra vLLM flags, passed verbatim — e.g. `--long-prefill-token-threshold 1024` for multi-client responsiveness (see [the concurrency section](#decoding-clients-stall-while-other-clients-prefill-the-long-prefill-token-threshold-slider)), `--api-key <secret>`. |
 
@@ -603,9 +604,19 @@ vllm:ple_mmap_rows_total             rows gathered
 vllm:ple_mmap_bytes_total            bytes read from the table
 ```
 
-They are registered in the EngineCore process and reach `/metrics` through
-prometheus_client's `MultiProcessCollector`, which vLLM already sets up. The three
-views worth graphing:
+They are registered in the EngineCore process, so they only reach `/metrics` when
+prometheus_client runs in multiprocess mode. vLLM turns that on only for
+`api_server_count > 1`; `scripts/serve.sh` does it for the single-server setup used here when you opt in with
+`PROM_MULTIPROC=1`, by pointing `PROMETHEUS_MULTIPROC_DIR` at a fresh tmpfs.
+
+Switching to multiprocess mode was checked against a live server by diffing the
+complete `/metrics` before and after: vLLM's other 71 metric families are exported with
+identical label sets and no per-process `pid` label. The only loss is the 35
+`*_created` families, which prometheus_client does not export in multiprocess mode; that is why
+exporting the counters is opt-in, so nothing changes for existing dashboards unless you
+ask for it.
+
+The three views worth graphing:
 
 ```promql
 rate(vllm:ple_mmap_op_seconds_total[5m]) / rate(vllm:ple_mmap_lookup_ops_total[5m])

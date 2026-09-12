@@ -224,7 +224,7 @@ cmd_serve() {
   local b; b="$(image_base)"
   [ -n "$b" ] && [ "$b" != "$BASE_EXPECTED" ] && die "$IMAGE is a '$b'-base image, profile '$profile' expects '$BASE_EXPECTED' — run: ./flash setup $profile"
   if [ "$(container_state)" = running ]; then info "$NAME is running and will be replaced"; fi
-  if [ "$DRY" = 1 ]; then info "dry run: would exec scripts/serve.sh with the environment above"; env | grep -E '^(MODE|IMAGE|NAME|PORT|CTX|YARN|MTP|SEQS|GPU_MEM|KV_DTYPE|PREFIX_CACHE|DET_TOPK|EXACT_TOPK|PAD_M4|DRAFT_VOCAB|MADVISE|PREWARM|EXTRA|BASE|LOG_REQUESTS|WORKERS)=' | sort | sed 's/^/    /'; return 0; fi
+  if [ "$DRY" = 1 ]; then info "dry run: would exec scripts/serve.sh with the environment above"; env | grep -E '^(MODE|IMAGE|NAME|PORT|CTX|YARN|MTP|SEQS|GPU_MEM|KV_DTYPE|PREFIX_CACHE|DET_TOPK|EXACT_TOPK|PAD_M4|DRAFT_VOCAB|MADVISE|PREWARM|COMPILE_CACHE|EXTRA|BASE|LOG_REQUESTS|WORKERS)=' | sort | sed 's/^/    /'; return 0; fi
   remember_profile "$profile"
   exec "$HERE/scripts/serve.sh"
 }

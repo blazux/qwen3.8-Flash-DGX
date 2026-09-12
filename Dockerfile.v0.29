@@ -1,0 +1,68 @@
+# Qwen3.8-Flash-Next on a DGX Spark — vLLM v0.29.0 base (the official release that ships the model as
+# `vllm/models/qwen4_exp`). Same patch set as the preview-image Dockerfile, re-targeted:
+#   1 PLE mmap, 2 GB10 FLA fixes, 4 prefix-caching block_size fix, 5 exact top-k, 6 hybrid mode,
+#   8 deterministic top-k kernel, 10 reduced draft vocabulary.
+# Not needed here: 3 (vllm#50729 is in) and 9 (vllm#52775 is in). Not ported yet: 7 (fp8 KV cache).
+#
+#   docker build -f Dockerfile.v0.29 -t qwen38-flash-dgx:v0.29 .
+#   IMAGE=qwen38-flash-dgx:v0.29 scripts/serve.sh      # serve.sh reads the image label for the op names
+FROM vllm/vllm-openai:v0.29.0
+LABEL qwen38.base=v0.29
+ARG SP=/usr/local/lib/python3.12/dist-packages
+ARG PKG=${SP}/vllm/models/qwen4_exp/nvidia
+ARG PLE=${PKG}/ple_layer.py
+
+# --- 1. PLE n-gram table from disk (VLLM_PLE_MMAP=1) — v0.29 layout handled by apply() ---
+COPY src/vllm_ple_mmap.py ${SP}/vllm_ple_mmap.py
+RUN cp ${PLE} ${PLE}.orig \
+ && printf '\n\n# --- qwen38-flash-dgx: serve the PLE n-gram table from disk (VLLM_PLE_MMAP=1) ---\nfrom vllm_ple_mmap import apply as _ple_mmap_apply\n_ple_mmap_apply(Qwen4ExpNGramEmbedding)\n' >> ${PLE} \
+ && python3 -c "import ast; ast.parse(open('${PLE}').read()); print('ple_layer.py patched OK')"
+
+# --- 2. GB10 FLA fixes (@Saren-Arterius) ---
+ARG FLA_UTILS=${SP}/vllm/third_party/flash_linear_attention/ops/utils.py
+ARG FLA_CDH=${SP}/vllm/third_party/flash_linear_attention/ops/chunk_delta_h.py
+RUN sed -i 's|DEFAULT = 102400|DEFAULT = 101376  # spark-fla-shmem: GB10 99KiB, big GDN tiles fit|' ${FLA_UTILS} \
+ && grep -q "spark-fla-shmem" ${FLA_UTILS} && echo "fla shmem gate patched" \
+ && sed -i 's|for num_warps in \[2, 4\]|for num_warps in [2]  # spark-fla-warps: fla#953 Blackwell tl.dot race|' ${FLA_CDH} \
+ && grep -q "spark-fla-warps" ${FLA_CDH} && echo "fla num_warps pinned"
+
+# --- 4. Prefix caching: block_size fix (still needed on v0.29: core.py takes the min group block) ---
+COPY src/patch_mamba_block_size.py /tmp/patch_mamba_block_size.py
+RUN python3 /tmp/patch_mamba_block_size.py ${SP} && rm /tmp/patch_mamba_block_size.py
+
+# --- 5. Exact QSA top-k fallback (VLLM_QSA_EXACT_TOPK=1) ---
+COPY src/patch_qsa_exact_topk.py /tmp/patch_qsa_exact_topk.py
+RUN python3 /tmp/patch_qsa_exact_topk.py ${PKG}/ops/qsa.py && rm /tmp/patch_qsa_exact_topk.py
+
+# --- 6. Hybrid mode: NVFP4 experts + blockwise-fp8 side layers (VLLM_FP8_HYBRID=1) ---
+ARG MO=${SP}/vllm/model_executor/layers/quantization/modelopt.py
+ARG QSA=${PKG}/qsa.py
+COPY src/vllm_fp8_hybrid_modelopt.py ${SP}/vllm_fp8_hybrid_modelopt.py
+RUN cp ${MO} ${MO}.orig \
+ && printf '\n\n# --- qwen38-flash-dgx: NVFP4 + blockwise-fp8 side layers (VLLM_FP8_HYBRID=1) ---\nfrom vllm_fp8_hybrid_modelopt import apply as _fp8_hybrid_apply\n_fp8_hybrid_apply()\n' >> ${MO} \
+ && python3 -c "import ast; ast.parse(open('${MO}').read()); print('modelopt.py hooked OK')" \
+ && cp ${QSA} ${QSA}.orig \
+ && sed -i 's/quant_config=model\.without_modelopt_fp4(quant_config)/quant_config=_fp8_hybrid_excluded(quant_config)/' ${QSA} \
+ && sed -i 's/^from \. import model$/from . import model\nfrom vllm_fp8_hybrid_modelopt import excluded_quant_config as _fp8_hybrid_excluded/' ${QSA} \
+ && grep -q "_fp8_hybrid_excluded(quant_config)" ${QSA} && grep -q "^from vllm_fp8_hybrid_modelopt import" ${QSA} \
+ && python3 -c "import ast; ast.parse(open('${QSA}').read()); print('qsa.py hooked OK')"
+
+# --- 8. Deterministic persistent_topk kernel (@jschmied, vllm#55122), built with the image's nvcc ---
+ARG KDET_SHA=e0ef69d4f5575dad00d34e05479eaf4c6547bace
+ARG KDET=https://raw.githubusercontent.com/jschmied/qwen38-flash-next-gb10/${KDET_SHA}
+ARG DET_ARCH=121a
+ADD --checksum=sha256:138cacfc5eb117f0922d53c88727e4d0dc26dcfb246c3d401fc280cfc726cc71 ${KDET}/patches/kernel-det/build_det.py /opt/llm/kernel-det/src/build_det.py
+ADD --checksum=sha256:b103fbeaf7589b9468471142ad0b30012a076f93d20ba11fc5ff6dcb1ecd32a6 ${KDET}/patches/kernel-det/bindings_det.cpp /opt/llm/kernel-det/src/bindings_det.cpp
+ADD --checksum=sha256:19e1d53425ea9a839445722fd1dac1c41727128eebdce84508c1bfb8592afecf ${KDET}/patches/kernel-det/topk_det.cu /opt/llm/kernel-det/src/topk_det.cu
+ADD --checksum=sha256:16939700ae389750782ff5c0d5b9caef59aa0ff8b869b64ec94fa72c814910ee ${KDET}/patches/kernel-det/torch_utils.h /opt/llm/kernel-det/src/torch_utils.h
+ADD --checksum=sha256:b4ef9ce298d43d6c0e6db9fcca451df20815b2cfe33791919c1ad9c0e84f0ba7 ${KDET}/patches/kernel-det/persistent_topk.cuh /opt/llm/kernel-det/src/persistent_topk.cuh
+ADD --checksum=sha256:70905073fe3fa361030bf1cb469b74610766bdfe361419cd7df50af2561322e3 ${KDET}/tools/determinism/qsadet_patch.py /tmp/qsadet_patch.py
+RUN cd /opt/llm/kernel-det/src && DET_BUILD_DIR=/opt/llm/kernel-det/build DET_ARCH=${DET_ARCH} python3 build_det.py 2>&1 | tail -2 \
+ && cp /opt/llm/kernel-det/build/_C_det.so /opt/llm/kernel-det/_C_det.so \
+ && VLLM_QSA_PY=${PKG}/ops/qsa.py python3 /tmp/qsadet_patch.py && rm /tmp/qsadet_patch.py \
+ && python3 -c "import ast; ast.parse(open('${PKG}/ops/qsa.py').read()); print('qsadet wired OK')"
+
+# --- 10. Reduced draft vocabulary for the MTP drafter (VLLM_MTP_DRAFT_VOCAB) ---
+COPY src/patch_mtp_draft_vocab.py /tmp/patch_mtp_draft_vocab.py
+COPY src/draft_vocab_65536.npy /opt/llm/draft_vocab_65536.npy
+RUN python3 /tmp/patch_mtp_draft_vocab.py ${PKG}/mtp.py && rm /tmp/patch_mtp_draft_vocab.py

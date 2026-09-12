@@ -187,6 +187,7 @@ aggregate throughput of ~267 tok/s at 48 streams with page-fault cost per token
 
 - vLLM recipe: <https://recipes.vllm.ai/Qwen/Qwen3.8-Flash-Next>
 - vLLM PR (Flash-Next support): <https://github.com/vllm-project/vllm/pull/53896>
+- vLLM v0.29.0 release (first official build with the model, as `qwen4_exp`): <https://github.com/vllm-project/vllm/releases/tag/v0.29.0> — see [the port notes](#the-vllm-v0290-port-dockerfilev029)
 - NVFP4 checkpoint: <https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4>
 - SGLang day-0 write-up (PLE offload mechanics): <https://www.lmsys.org/blog/2026-08-26-qwen-flash-next>
 
@@ -481,3 +482,80 @@ raw-key ring stay as they are — which is why bf16 at 1M asked for 26.3 GiB and
 We keep bf16 in production: the model's speed is our scarcest resource and the b3
 regression is the kind of long-reasoning case we care about. The option is there for
 workloads that need the context.
+
+## The vLLM v0.29.0 port (`Dockerfile.v0.29`)
+
+Everything above was built on Qwen's preview image (`qwenllm/qwen3.8-flash-next-vllm`,
+a vLLM `0.20.x` dev build carrying the model as `vllm/models/qwen3_8_flash_next`). vLLM
+**v0.29.0** is the first official release with the model in-tree, renamed
+`vllm/models/qwen4_exp` (classes `Qwen4Exp*`, ops `vllm::qwen4_exp_*`), with an arm64
+image. [@ChengYen-Tang](https://github.com/ChengYen-Tang) asked whether the recipe would
+move ([issue #14](https://github.com/blazux/qwen3.8-Flash-DGX/issues/14)); this is what the
+port took and what it measures.
+
+**Patch by patch.** Every path in the Dockerfile moves from
+`vllm/models/qwen3_8_flash_next/nvidia/` to `vllm/models/qwen4_exp/nvidia/`; beyond that:
+
+- **3 (vllm#50729, Mamba state-copy race) and 9 (fp8 GEMM `M%4`, vllm#52775) are in the
+  release** and are not applied. `PAD_M4` is therefore a no-op on this base and
+  `scripts/serve.sh` says so.
+- **4 (prefix-caching block size) is still needed.** `v1/engine/core.py` still overwrites
+  `cache_config.block_size` with the *smallest* group block size; the worker's align-mode
+  state-slot seed and the scheduler's block-aligned prefill split now read
+  `mamba_block_size` / the scheduler's own `block_size` (the LCM of the groups), so the
+  same two-line fix applies. Prefix-cache hits are bit-exact (log-prob delta 0.0000 on
+  cached vs uncached prefills, four prompts).
+- **1 (PLE mmap) is rewritten.** The preview layer did hashing and lookup in one Python
+  `forward_impl`, which we replaced wholesale. The release splits it: a compiled op
+  `qwen4_exp_compute_ple_ngram_ids` computes the n-gram ids on the GPU, then a
+  `PLEVocabParallelEmbedding` (in `common/ple.py`) looks them up and hands the layer a
+  `weight_scale` for the FP8 dequant. We keep the stock id op and swap only the embedding:
+  `apply()` detects the layout (no `forward_impl` → v0.29), wraps `__init__` so the
+  embedding is our `_MmapNgramEmbedding` (the `ple_layer` module's reference to
+  `PLEVocabParallelEmbedding` is replaced for the duration of the constructor), overrides
+  `load_weights` to drop the table shards and keep only `weight_scale`, and overrides
+  `forward` to call the stock id op followed by a new splitting op,
+  `vllm::ple_mmap_lookup_ids(ngram_ids, output, layer_name)`, which gathers the rows from
+  the mmap into a pinned buffer and copies them into `output`. Same `MmapPleTable`, same
+  workers/chunk/prewarm/madvise knobs, same 48 GiB saved. One structural difference: the
+  ids now live on the GPU, so each lookup starts with a device→host copy of 16 × N int64s
+  (the preview computed them on the CPU). In the decode logs it is invisible (1.9–2.1 ms
+  per op vs 1.1–1.3 ms of pure gather); on prefill it is inside the same 2,500–3,000 tok/s
+  band as the preview image.
+- **2, 5, 6, 8, 10 apply as-is** once re-targeted. The draft-vocabulary hook now finds the
+  MTP class by pattern (`class \w+MTP\(`) instead of by name, so one file serves both bases.
+- **7 (fp8 KV on the QSA path) is not ported yet.** The QSA Triton kernels moved and were
+  edited upstream; the patch needs a re-derivation, not a path change. `scripts/serve.sh`
+  refuses `KV_DTYPE≠auto` on this base rather than silently running bf16.
+
+**Serving.** The splitting-op list changes names (`vllm::qwen4_exp_ple_short_conv`,
+`vllm::qwen4_exp_qsa_with_output`, and `vllm::qwen4_exp_compute_ple_ngram_ids` must be in
+it too, or the id op gets captured with the lookup after it), and the new lookup op is
+`vllm::ple_mmap_lookup_ids`. Both Dockerfiles stamp `LABEL qwen38.base=preview|v0.29` and
+`serve.sh` reads it, so the same command line works on both. The Inductor int64 assert
+that forced `torch.compile` off on the preview image does not fire on the release, so
+compile is on (≈28 s at boot); graphs stay PIECEWISE for the reason in
+[Three GB10 bugs](#three-gb10-bugs-this-works-around).
+
+**Measured** (GX10, hybrid, default recipe: deterministic top-k, reduced draft vocabulary,
+`MADV_RANDOM`, prefix caching, MTP=2, YaRN 500k, `GPU_MEM=0.80`):
+
+| | preview image | v0.29 base |
+|---|---|---|
+| KV pool | ~630k tokens | 575,757–578,787 tokens (the release reserves more during profiling) |
+| Determinism (4 prompts × repeats, temperature 0) | 4/4 | 4/4 |
+| Decode, single stream, median of 6 | ~37 tok/s | 36.4 tok/s (33.8–41.5) |
+| Prefill warm, 8k / 32k | ~2,500–3,000 tok/s | 2,529 / 3,026 tok/s |
+| Prefill cold table region, 8k / 32k (×3, salted prompts) | | 2,504–2,513 / 2,444–2,448 tok/s |
+| Needle at 92,157 tokens | ~45 s | found, 45.4 s |
+| MTP draft acceptance (65,536-id vocabulary) | ~68% | 64.8% (8 samples) |
+| Tournament, 17 scenarios × 3, temperature 0.2 | 45/51 @ 38.5 tok/s | run 1: 42.5/51 @ 39.2 (two `length` finishes, one partial); run 2: **45/51 @ 38.7**, 0 errors, no runaways |
+
+Run 2 fails exactly the scenarios the preview image fails (`b6_reconcile`,
+`c5_inventory_reconcile`, which every quantization we tried fails). Run 1's deficit is two
+reasoning runaways that hit the token cap, which we see in roughly one run in three on any
+configuration; it is the day-to-day variance of this benchmark, not a property of the base.
+Verdict: parity in quality and speed, −8% KV and −3 points of draft acceptance that we have
+not investigated. The preview `Dockerfile` stays the default and our production image for
+now; `Dockerfile.v0.29` is the tested path onto the release line, and will become the
+default once fp8 KV is ported and it has run in production for a while.

@@ -59,7 +59,10 @@ if _dv_os.environ.get("VLLM_MTP_DRAFT_VOCAB"):
 src = open(TARGET).read()
 if MARK in src:
     print("  draft-vocab hook already installed"); sys.exit(0)
-assert "class Qwen3_8FlashNextMTP(" in src, "MTP class not found"
-open(TARGET, "w").write(src.rstrip("\n") + HOOK)
+import re
+m = re.search(r"^class (\w+MTP)\(", src, re.M)
+assert m, "MTP class not found (expected 'class <Name>MTP(')"
+MTP_CLASS = m.group(1)   # Qwen3_8FlashNextMTP on the preview image, Qwen4ExpMTP on vLLM >= 0.29
+open(TARGET, "w").write(src.rstrip("\n") + HOOK.replace("Qwen3_8FlashNextMTP", MTP_CLASS))
 import ast; ast.parse(open(TARGET).read())
 print("  draft-vocab hook INSTALLED in", TARGET, "(inert unless VLLM_MTP_DRAFT_VOCAB is set)")

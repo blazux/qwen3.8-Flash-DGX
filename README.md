@@ -37,6 +37,9 @@ what you get on a GX10: ~37 tok/s single-stream decode, ~2,500–3,000 tok/s pre
 caching, deterministic greedy output, 500k tokens of context. Want the checkpoint exactly as
 published? Drop `prepare-hybrid.sh` and `MODE=hybrid`. Want speed over the last percent of
 quality? `MTP=3`, and `MODE=hybrid-mtp` for more KV — both explained in the [options table](#how-the-defaults-are-chosen-quality-first-speed-as-an-option).
+Prefer the current vLLM release to the preview image? `docker build -f Dockerfile.v0.29 -t qwen38-flash-dgx:v0.29 .`
+and `IMAGE=qwen38-flash-dgx:v0.29` — same recipe, same defaults, measured at parity
+(see [vLLM v0.29.0 as the base image](#vllm-v0290-as-the-base-image-dockerfilev029)).
 Everything below is the long version: what was broken on GB10, what was fixed, and the numbers.
 
 > **Independently reproduced** on a DGX Spark by
@@ -44,9 +47,25 @@ Everything below is the long version: what was broken on GB10, what was fixed, a
 > [issue #1](https://github.com/blazux/qwen3.8-Flash-DGX/issues/1) and their
 > [write-up](https://github.com/jschmied/qwen38-flash-next-gb10).
 
-## Update 2026-09-08 — what changed
+## Update 2026-09-11 — what changed
 
 Newest first. If you cloned this before, this is the short version; details in the linked sections.
+
+**2026-09-11** — the recipe runs on the vLLM **v0.29.0** release too:
+
+- **`Dockerfile.v0.29`** builds the same recipe on `vllm/vllm-openai:v0.29.0`, the first official
+  release that ships the model natively (as `qwen4_exp`), instead of the Qwen preview image.
+  Prompted by [@ChengYen-Tang](https://github.com/ChengYen-Tang) (issue #14). Two of our patches
+  are in that release and are dropped there (vllm#50729, the fp8 GEMM `M%4` fix vllm#52775); the
+  prefix-caching block-size fix, the GB10 FLA gate, the deterministic top-k kernel, the hybrid
+  dispatch and the reduced draft vocabulary are still needed and were re-targeted; the PLE
+  mmap patch was rewritten for the new layer. **Measured at parity** on the tournament
+  (45/51 at 38.7 tok/s vs 45/51 at 38.5 on the preview image, same two scenarios failed; a
+  first run gave 42.5/51 with two reasoning runaways, within the usual variance), decode
+  36.4 tok/s, prefill 2,529–3,026 tok/s, KV ~580k tokens (−8%, the release reserves more).
+  `scripts/serve.sh` reads the base from an image label and adjusts the splitting ops.
+  Not ported yet: the fp8 KV cache (patch 7). The preview `Dockerfile` stays the default
+  until the v0.29 base has more field time. → [vLLM v0.29.0 as the base image](#vllm-v0290-as-the-base-image-dockerfilev029)
 
 **2026-09-08** — the defaults are now decided by an agentic/coding benchmark (called tournament), and two new ones came out of it:
 
@@ -414,6 +433,61 @@ first rows are equivalent in quality; the last one shows why MTP=3 stays an opti
 needle 92k in 45.5 s, 4/4 deterministic. The KV pool loses the 320 MiB slice plus the
 full-width logits buffer the patch rebuilds per draft step (about 60k tokens at `GPU_MEM=0.80`).
 
+## vLLM v0.29.0 as the base image (`Dockerfile.v0.29`)
+
+The default `Dockerfile` patches Qwen's preview image (`qwenllm/qwen3.8-flash-next-vllm`).
+vLLM **v0.29.0** is the first official release that ships the model natively — the package
+moved to `vllm/models/qwen4_exp`, there is an arm64 image, and two of the fixes this repo
+carried are in the release. `Dockerfile.v0.29` builds the same recipe on top of it:
+
+```bash
+docker build -f Dockerfile.v0.29 -t qwen38-flash-dgx:v0.29 .
+IMAGE=qwen38-flash-dgx:v0.29 MODE=hybrid YARN=1 CTX=500000 scripts/serve.sh
+```
+
+Same weights, same snapshot, same env knobs and defaults (`MODE`, `DET_TOPK`, `DRAFT_VOCAB`,
+`MADVISE`, `PREFIX_CACHE`, `MTP`, …). Both images carry a `qwen38.base` label and
+`scripts/serve.sh` reads it to pick the right splitting-op names (`BASE=preview|v0.29` overrides).
+
+What changes in the patch set:
+
+| patch | preview image | v0.29 base |
+|---|---|---|
+| 1 PLE mmap | hooks `forward_impl` | rewritten: the release computes the n-gram ids in a GPU op and looks them up in a `PLEVocabParallelEmbedding`; we swap that layer for the mmapped table and keep the stock id computation (same file, `apply()` detects the layout) |
+| 2 GB10 FLA fixes | needed | needed (same file) |
+| 3 vllm#50729 Mamba state-copy race | needed | **in the release, dropped** |
+| 4 prefix-caching block_size | needed | needed (`core.py` still takes the smallest group block size) |
+| 5 exact top-k, 8 deterministic kernel | needed | needed, re-targeted (vllm#55122 is still open) |
+| 6 hybrid dispatch, 10 reduced draft vocabulary | needed | needed, re-targeted |
+| 7 fp8 KV cache | opt-in | **not ported yet** — `KV_DTYPE` must stay `auto`, serve.sh refuses otherwise |
+| 9 `M%4` padding | opt-in | **in the release (vllm#52775), dropped**; `PAD_M4` is a no-op there |
+
+Two things got simpler on the release: the Inductor int64-indexing assert that forced
+`torch.compile` off on the preview image is gone (compile is on, graphs stay PIECEWISE
+because the gather still has to run between graph segments), and the FLA/short-conv kernels
+need no `--enforce-eager` workarounds.
+
+Measured on our GX10, hybrid, the default recipe, YaRN 500k, same day as the preview numbers:
+
+| | preview image (default) | v0.29 base |
+|---|---|---|
+| Tournament (17 × 3, temperature 0.2) | 45/51 @ 38.5 tok/s | **45/51 @ 38.7 tok/s** (run 2); 42.5/51 @ 39.2 (run 1, two reasoning runaways) |
+| Decode, single stream (median of 6) | ~37 tok/s | 36.4 tok/s |
+| Prefill, warm page cache | ~2,500–3,000 tok/s | 2,529 (8k) / 3,026 (32k) tok/s |
+| Prefill, cold table region | | 2,513 (8k) / 2,447 (32k) tok/s |
+| Needle at 92k | ~45 s | 45.4 s |
+| MTP acceptance (reduced vocabulary) | ~68% | 64.8% |
+| KV pool @0.80 | ~630k tokens | ~577k tokens |
+| Deterministic at temperature 0 / prefix-cache hit bit-exact | yes / yes | yes (4/4) / yes (log-prob delta 0.0000) |
+
+The two tournament runs fail exactly the same scenarios as the preview image (the two that
+every quantization we tried fails); the 42.5 of the first run is two `length` finishes, the
+reasoning runaways we see in about one run out of three on any configuration. So: parity,
+with a slightly smaller KV pool and slightly lower draft acceptance, both of which we have
+not chased yet. **The preview `Dockerfile` remains the default** until this base has more
+field time on our own box; if you want to be on the release line, it is ready and tested.
+Full port notes in [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md#the-vllm-v0290-port-dockerfilev029).
+
 ## Tuning (env vars for `scripts/serve.sh`)
 
 | Var | Default | Notes |
@@ -574,8 +648,10 @@ Details: [results-radixark-vllm.md](https://github.com/jschmied/qwen38-flash-nex
 ## What's in here
 
 ```
-Dockerfile                        official vLLM Flash-Next image + the patches below
+Dockerfile                        official vLLM Flash-Next preview image + the patches below (default)
+Dockerfile.v0.29                  same recipe on the vLLM v0.29.0 release (patches 3 and 9 dropped, 7 not ported)
 src/vllm_ple_mmap.py              1. mmap PLE table (opaque splitting op)            VLLM_PLE_MMAP=1
+                                     handles both layouts (preview forward_impl hook / v0.29 embedding swap)
 src/mamba_utils_guarded.py        3. vllm#50729 + bounds guard (drop-in mamba_utils.py)
 src/patch_mamba_block_size.py     4. prefix-caching block_size fix
 src/patch_qsa_exact_topk.py       5. exact, deterministic QSA top-k                  VLLM_QSA_EXACT_TOPK=1
@@ -612,10 +688,11 @@ docker run --rm -v "$PWD/src:/t" -w /t --entrypoint python3 qwen38-flash-dgx tes
 - **One big model at a time.** At `GPU_MEM=0.80` this uses most of the 128 GB pool;
   don't co-locate another large model (an 8B embedding model next to it already
   starves the KV cache — we moved ours to another machine).
-- **Full `torch.compile` is off** (an Inductor int64-indexing assert on sm_121); the
-  serve script uses PIECEWISE CUDA graphs with the PLE lookup as a splitting op.
-- **1M context** needs the fp8 KV cache (`KV_DTYPE=fp8_e4m3`, see above), which costs
-  speed and some quality; in bf16 a single 1M request needs ~26 GiB of KV and 500k with
+- **Full `torch.compile` is off on the preview image** (an Inductor int64-indexing assert
+  on sm_121; gone on the v0.29 base); on both, the serve script uses PIECEWISE CUDA graphs
+  with the PLE lookup as a splitting op.
+- **1M context** needs the fp8 KV cache (`KV_DTYPE=fp8_e4m3`, see above; preview image
+  only, not ported to the v0.29 base yet), which costs speed and some quality; in bf16 a single 1M request needs ~26 GiB of KV and 500k with
   YaRN is the validated ceiling (800k booted but got OOM-killed on a long prefill).
 - **Exact top-k costs prefill** on long prompts (see above). The implementation is a
   plain `torch.topk` over the full visible width per chunk; a fused kernel would recover
@@ -629,6 +706,7 @@ docker run --rm -v "$PWD/src:/t" -w /t --entrypoint python3 qwen38-flash-dgx tes
 ## Credits
 
 - `tools/vllm_watch.py`, the live session viewer: **[@0x3dlux](https://github.com/0x3dlux)** (issue #12).
+- The nudge to port the recipe to the vLLM v0.29.0 release: **[@ChengYen-Tang](https://github.com/ChengYen-Tang)** (issue #14).
 
 - The two ideas behind the reduced draft vocabulary and the `MADV_RANDOM` table advice come
   from **[MiaAI-Lab](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark)**'s

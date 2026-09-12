@@ -40,6 +40,8 @@
 #   WORKERS=32        threads for the mmap gather
 #   EXTRA=            extra vllm flags passed verbatim
 #   IMAGE=qwen38-flash-dgx   MODEL=RadixArk/Qwen3.8-Flash-Next-NVFP4
+#   BASE=             preview|v0.29 — normally read from the image label (Dockerfile vs Dockerfile.v0.29).
+#                     On v0.29: KV_DTYPE must stay auto (fp8 KV not ported), PAD_M4 is a no-op.
 set -euo pipefail
 
 NAME="${NAME:-qwen38-flash}"
@@ -100,7 +102,23 @@ SNAP_IN="/hf/hub/models--${MODEL//\//--}/snapshots/$SNAP_NAME"
 
 # The PLE gather is a CPU op + a pageable host->device copy: it MUST run outside
 # CUDA graphs. We declare it a splitting op and use PIECEWISE capture (never FULL*).
-SPLIT='["vllm::unified_attention_with_output","vllm::unified_mla_attention_with_output","vllm::mamba_mixer2","vllm::mamba_mixer","vllm::short_conv","vllm::qwen3_8_flash_next_ple_short_conv","vllm::qwen3_8_flash_next_qsa_with_output","vllm::linear_attention","vllm::qwen_gdn_attention_core","vllm::qwen_gdn_attention_core_fused_norm_packed","vllm::sparse_attn_indexer","vllm::ple_mmap_lookup"]'
+# The splitting-op names depend on the base image: the preview names the model qwen3_8_flash_next and
+# our PLE op is ple_mmap_lookup; vLLM >= 0.29 names it qwen4_exp and the op is ple_mmap_lookup_ids.
+# Both Dockerfiles stamp a label so this picks the right list (BASE=preview|v0.29 overrides).
+BASE="${BASE:-$(docker image inspect -f '{{index .Config.Labels "qwen38.base"}}' "$IMAGE" 2>/dev/null || true)}"
+if [ "$BASE" = "v0.29" ]; then
+  SPLIT='["vllm::unified_attention_with_output","vllm::unified_mla_attention_with_output","vllm::mamba_mixer2","vllm::mamba_mixer","vllm::short_conv","vllm::qwen4_exp_compute_ple_ngram_ids","vllm::qwen4_exp_ple_short_conv","vllm::qwen4_exp_qsa_with_output","vllm::linear_attention","vllm::qwen_gdn_attention_core","vllm::qwen_gdn_attention_core_fused_norm_packed","vllm::sparse_attn_indexer","vllm::ple_mmap_lookup_ids"]'
+else
+  SPLIT='["vllm::unified_attention_with_output","vllm::unified_mla_attention_with_output","vllm::mamba_mixer2","vllm::mamba_mixer","vllm::short_conv","vllm::qwen3_8_flash_next_ple_short_conv","vllm::qwen3_8_flash_next_qsa_with_output","vllm::linear_attention","vllm::qwen_gdn_attention_core","vllm::qwen_gdn_attention_core_fused_norm_packed","vllm::sparse_attn_indexer","vllm::ple_mmap_lookup"]'
+fi
+# Options the v0.29 image does not carry: patch 7 (fp8 KV on the QSA path) is not ported, and patch 9
+# (M%4 padding) is unnecessary there (vllm#52775 is in the release) so the image has no such kernel.
+if [ "$BASE" = "v0.29" ]; then
+  if [ "$KV_DTYPE" != auto ]; then
+    echo "!! KV_DTYPE=$KV_DTYPE: the fp8 KV cache patch is not ported to the v0.29 base yet — use the preview image (Dockerfile) for fp8 KV"; exit 1
+  fi
+  [ "$PAD_M4" != 0 ] && echo "!! PAD_M4 has no effect on the v0.29 base (vllm#52775 fixed the fp8 GEMM there); ignoring" && PAD_M4=0
+fi
 CC="${CC:--cc.cudagraph_mode=PIECEWISE -cc.splitting_ops=$SPLIT}"
 
 # YaRN (Qwen's published recipe) to go past the native 262144.

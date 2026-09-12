@@ -20,6 +20,7 @@
 # The base image is multi-arch (arm64 for the Spark's Grace CPU). Pinned by digest
 # for reproducibility; bump the tag below if the upstream recipe moves.
 FROM vllm/vllm-openai:qwen38-flash-next@sha256:fc120ece0a388cc0aa1caad4a9f1cd92113484ab7ec2fd0efadd62585be05bf8
+LABEL qwen38.base=preview
 
 # Package layout inside the official image (vLLM 0.1.dev20073, torch 2.13 cu130,
 # numpy 2.2.6 — the patch needs numpy, already present).

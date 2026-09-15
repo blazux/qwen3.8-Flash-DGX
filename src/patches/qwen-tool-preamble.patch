@@ -1,0 +1,163 @@
+diff --git a/vllm/parser/engine/parser_engine_config.py b/vllm/parser/engine/parser_engine_config.py
+index 4799604..164aa55 100644
+--- a/vllm/parser/engine/parser_engine_config.py
++++ b/vllm/parser/engine/parser_engine_config.py
+@@ -100,6 +100,9 @@ class ParserEngineConfig:
+     # Reject tool calls whose names are absent from the request tools.
+     validate_tool_names: bool = False
+ 
++    # Delay a tool wrapper until its whitespace-only preamble reaches TOOL_NAME.
++    validate_tool_preamble: bool = False
++
+     @cached_property
+     def terminal_defs(self):
+         from vllm.parser.engine.incremental_lexer import terminals_from_literals
+diff --git a/vllm/parser/engine/streaming_parser_engine.py b/vllm/parser/engine/streaming_parser_engine.py
+index ec21b05..d42f57e 100644
+--- a/vllm/parser/engine/streaming_parser_engine.py
++++ b/vllm/parser/engine/streaming_parser_engine.py
+@@ -207,6 +207,9 @@ class StreamingParserEngine:
+         self._message_header_buffer = ""
+         self._message_header_token_count = 0
+         self._in_skipped_tool_span = False
++        self._pending_tool_start: tuple[str, str, int] | None = None
++        self._tool_preamble_buffer = ""
++        self._tool_preamble_token_count = 0
+         self._reset_args_state()
+ 
+     def feed(
+@@ -284,6 +287,8 @@ class StreamingParserEngine:
+ 
+         events.extend(self._process_lex_tokens(self._lexer.flush()))
+ 
++        events.extend(self._confirm_tool_preamble())
++
+         if self._args_buffer:
+             events.append(
+                 SemanticEvent(
+@@ -359,8 +364,28 @@ class StreamingParserEngine:
+     )
+ 
+     def _on_terminal(
+-        self, terminal: str, value: str, token_count: int = 0
++        self,
++        terminal: str,
++        value: str,
++        token_count: int = 0,
++        *,
++        confirmed_tool_start: bool = False,
+     ) -> list[SemanticEvent]:
++        if self._pending_tool_start is not None:
++            next_transition = self.config.transitions.get(
++                (ParserState.TOOL_PREAMBLE, terminal)
++            )
++            if next_transition is not None and next_transition.next_state in (
++                ParserState.TOOL_NAME,
++                ParserState.CONTENT,
++            ):
++                events = self._confirm_tool_preamble()
++                events.extend(self._on_terminal(terminal, value, token_count))
++                return events
++            events = self._flush_tool_preamble()
++            events.extend(self._on_terminal(terminal, value, token_count))
++            return events
++
+         key = (self.state, terminal)
+         transition = self.config.transitions.get(key)
+ 
+@@ -372,6 +397,15 @@ class StreamingParserEngine:
+                 self._in_skipped_tool_span = False
+             return self._emit_for_state(value, token_count)
+ 
++        if (
++            self.config.validate_tool_preamble
++            and not confirmed_tool_start
++            and self.state in (ParserState.CONTENT, ParserState.REASONING)
++            and transition.next_state == ParserState.TOOL_PREAMBLE
++        ):
++            self._pending_tool_start = (terminal, value, token_count)
++            return []
++
+         if self.skip_tool_parsing and terminal in self._tool_terminals:
+             # Inkling reuses one terminal for tool, text, and reasoning exits.
+             # Outside a forwarded tool span, apply its normal transition.
+@@ -430,6 +464,26 @@ class StreamingParserEngine:
+         return self._apply_transition(transition, value, token_count)
+ 
+     def _emit_for_state(self, text: str, token_count: int = 0) -> list[SemanticEvent]:
++        if self._pending_tool_start is not None:
++            self._tool_preamble_buffer += text
++            self._tool_preamble_token_count += token_count
++            if text.strip():
++                candidate = self._tool_preamble_buffer.lstrip()
++                for (state, terminal), tr in self.config.transitions.items():
++                    if (
++                        state == ParserState.TOOL_PREAMBLE
++                        and tr.next_state == ParserState.TOOL_NAME
++                        and (literal := self.config.terminals.get(terminal))
++                        and any(
++                            value.startswith(candidate)
++                            for value in (
++                                (literal,) if isinstance(literal, str) else literal
++                            )
++                        )
++                    ):
++                        return []
++                return self._flush_tool_preamble()
++            return []
+         if self.state == ParserState.MESSAGE_HEADER:
+             self._message_header_buffer += text
+             self._message_header_token_count += token_count
+@@ -457,6 +511,30 @@ class StreamingParserEngine:
+             ]
+         return []
+ 
++    def _flush_tool_preamble(self) -> list[SemanticEvent]:
++        if self._pending_tool_start is None:
++            return []
++        _, opener, opener_count = self._pending_tool_start
++        text = opener + self._tool_preamble_buffer
++        count = opener_count + self._tool_preamble_token_count
++        self._pending_tool_start = None
++        self._tool_preamble_buffer = ""
++        self._tool_preamble_token_count = 0
++        return self._emit_for_state(text, count)
++
++    def _confirm_tool_preamble(self) -> list[SemanticEvent]:
++        if self._pending_tool_start is None:
++            return []
++        opener = self._pending_tool_start
++        text = self._tool_preamble_buffer
++        count = self._tool_preamble_token_count
++        self._pending_tool_start = None
++        self._tool_preamble_buffer = ""
++        self._tool_preamble_token_count = 0
++        events = self._on_terminal(*opener, confirmed_tool_start=True)
++        events.extend(self._emit_for_state(text, count))
++        return events
++
+     def _on_content(self, text: str, token_count: int = 0) -> list[SemanticEvent]:
+         if not text:
+             return []
+diff --git a/vllm/parser/nemotron_v3.py b/vllm/parser/nemotron_v3.py
+index c8b75a2..2141c98 100644
+--- a/vllm/parser/nemotron_v3.py
++++ b/vllm/parser/nemotron_v3.py
+@@ -37,4 +37,5 @@ def nemotron_v3_config(thinking: bool = True) -> ParserEngineConfig:
+         name="nemotron_v3",
++        validate_tool_preamble=False,
+         strip_trailing_reasoning_whitespace=True,
+     )
+ 
+diff --git a/vllm/parser/qwen3.py b/vllm/parser/qwen3.py
+index 8edf42e..fd40925 100644
+--- a/vllm/parser/qwen3.py
++++ b/vllm/parser/qwen3.py
+@@ -198,6 +198,7 @@ def qwen3_config(
+         stream_arg_deltas=True,
+         strip_trailing_reasoning_whitespace=False,
+         tool_args_json=False,
++        validate_tool_preamble=name == "qwen3",
+     )
+ 
+ 

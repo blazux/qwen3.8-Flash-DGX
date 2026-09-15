@@ -1,8 +1,8 @@
 # Qwen3.8-Flash-Next on a single DGX Spark / GB10, via vLLM.
 #
 # Starts from the official Qwen3.8-Flash-Next vLLM image and layers a handful of
-# patches on it. Every one of them is a no-op unless its runtime flag is set, so
-# the image still behaves like upstream with the flags off:
+# patches on it. Performance options are gated by runtime flags; correctness
+# fixes are enabled as listed below:
 #
 #   1. PLE table served from disk via mmap            (VLLM_PLE_MMAP=1)      — the one that makes it fit
 #   2. GB10 FLA fixes                                  (always on, harmless elsewhere)
@@ -14,6 +14,8 @@
 #   8. Deterministic persistent_topk kernel           (VLLM_QSA_DET_TOPK=1) — replaces 5 at no prefill cost
 #   9. M%4 padding for the blockwise-fp8 GEMM         (VLLM_FP8_PAD_M4=1)   — hybrid mode with prefix caching OFF
 #  10. Reduced draft vocabulary for the MTP drafter    (VLLM_MTP_DRAFT_VOCAB=<ids.npy>) — +20% decode, same tournament score
+#  11. ModelOpt mixed-precision block-FP8 experts     (VLLM_MODELOPT_BLOCK_MOE=0 disables)
+#  12. Lossless malformed Qwen tool preambles        (always on for the qwen3 parser)
 #
 #   docker build -t qwen38-flash-dgx .
 #
@@ -154,3 +156,9 @@ RUN python3 /tmp/patch_mtp_draft_vocab.py ${SP}/vllm/models/qwen3_8_flash_next/n
 COPY src/vllm_modelopt_block_moe.py ${SP}/vllm_modelopt_block_moe.py
 RUN printf '\n\n# --- qwen38-flash-dgx: FP8_BLOCK_SCALES support for ModelOpt MIXED_PRECISION (VLLM_MODELOPT_BLOCK_MOE=0 disables) ---\nfrom vllm_modelopt_block_moe import apply as _block_moe_apply\n_block_moe_apply()\n' >> ${MO} \
  && python3 -c "import ast; ast.parse(open('${MO}').read()); print('modelopt.py block-moe hooked OK')"
+
+# --- 12. Preserve quoted/malformed Qwen tool markers in reasoning and content ---
+# Confirm a tool preamble before switching output channels. Shared by both bases.
+COPY src/patches/qwen-tool-preamble.patch /tmp/qwen-tool-preamble.patch
+RUN cd ${SP} && patch --batch --forward --fuzz=0 -p1 < /tmp/qwen-tool-preamble.patch \
+ && rm /tmp/qwen-tool-preamble.patch

@@ -1,7 +1,7 @@
 # Qwen3.8-Flash-Next on a DGX Spark — vLLM v0.29.0 base (the official release that ships the model as
 # `vllm/models/qwen4_exp`). Same patch set as the preview-image Dockerfile, re-targeted:
 #   1 PLE mmap, 2 GB10 FLA fixes, 4 prefix-caching block_size fix, 5 exact top-k, 6 hybrid mode,
-#   8 deterministic top-k kernel, 10 reduced draft vocabulary.
+#   8 deterministic top-k kernel, 10 reduced draft vocabulary, 12 Qwen tool preamble fix.
 # Not needed here: 3 (vllm#50729 is in) and 9 (vllm#52775 is in). Not ported yet: 7 (fp8 KV cache).
 # 11 differs by base: here it is the vllm#55513 backport; the preview Dockerfile carries the FP8_BLOCK_SCALES shim.
 #
@@ -76,3 +76,9 @@ RUN python3 /tmp/patch_mtp_draft_vocab.py ${PKG}/mtp.py && rm /tmp/patch_mtp_dra
 # base that already has the fix.
 COPY src/patch_block_fp8_mtp.py /tmp/patch_block_fp8_mtp.py
 RUN python3 /tmp/patch_block_fp8_mtp.py ${SP} && rm /tmp/patch_block_fp8_mtp.py
+
+# --- 12. Preserve quoted/malformed Qwen tool markers in reasoning and content ---
+# Confirm a tool preamble before switching output channels. Shared by both bases.
+COPY src/patches/qwen-tool-preamble.patch /tmp/qwen-tool-preamble.patch
+RUN cd ${SP} && patch --batch --forward --fuzz=0 -p1 < /tmp/qwen-tool-preamble.patch \
+ && rm /tmp/qwen-tool-preamble.patch

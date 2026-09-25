@@ -57,7 +57,8 @@
 #                     README). A bare name becomes docker volumes, an absolute path binds dirs
 #   IMAGE=qwen38-flash-dgx   MODEL=nvidia/Qwen3.8-Flash-Next-NVFP4   (RadixArk/Qwen3.8-Flash-Next-NVFP4 still supported: MODEL=...)
 #   BASE=             preview|v0.29|v0.30 — normally read from the image label (Dockerfile vs Dockerfile.v0.29/.v0.30).
-#                     On v0.29/v0.30: KV_DTYPE must stay auto (fp8 KV not ported), PAD_M4 is a no-op.
+#                     On v0.29: KV_DTYPE must stay auto (fp8 KV not ported), PAD_M4 is a no-op.
+#                     On v0.30: KV_DTYPE=fp8_e4m3 works in images labelled qwen38.fp8kv (Dockerfile.v0.30), PAD_M4 is a no-op.
 set -euo pipefail
 
 NAME="${NAME:-qwen38-flash}"
@@ -187,6 +188,9 @@ fi
 # v0.30 dropped the qwen4_exp_compute_ple_ngram_ids op (hashing is a Triton kernel inside the graph).
 # Both Dockerfiles stamp a label so this picks the right list (BASE=preview|v0.29 overrides).
 BASE="${BASE:-$(docker image inspect -f '{{index .Config.Labels "qwen38.base"}}' "$IMAGE" 2>/dev/null || true)}"
+# Images carrying qwen38.fp8kv have patch 7 (fp8 KV on the QSA path) built in;
+# only those accept KV_DTYPE=fp8_e4m3 on a release base (see the gate below).
+FP8KV="$(docker image inspect -f '{{index .Config.Labels "qwen38.fp8kv"}}' "$IMAGE" 2>/dev/null || true)"
 if [ "$BASE" = "v0.30" ]; then
   # v0.30 defaults (CompilationConfig._attention_ops) + the two kv_cache_update ops vLLM appends when the
   # list is left unset + our PLE gather. The PLE hashing is a plain Triton kernel now (no split op).
@@ -196,11 +200,12 @@ elif [ "$BASE" = "v0.29" ]; then
 else
   SPLIT='["vllm::unified_attention_with_output","vllm::unified_mla_attention_with_output","vllm::mamba_mixer2","vllm::mamba_mixer","vllm::short_conv","vllm::qwen3_8_flash_next_ple_short_conv","vllm::qwen3_8_flash_next_qsa_with_output","vllm::linear_attention","vllm::qwen_gdn_attention_core","vllm::qwen_gdn_attention_core_fused_norm_packed","vllm::sparse_attn_indexer","vllm::ple_mmap_lookup"]'
 fi
-# Options the v0.29 image does not carry: patch 7 (fp8 KV on the QSA path) is not ported, and patch 9
-# (M%4 padding) is unnecessary there (vllm#52775 is in the release) so the image has no such kernel.
+# Options an image may not carry: patch 7 (fp8 KV on the QSA path) ships only in images labelled
+# qwen38.fp8kv, and patch 9 (M%4 padding) is unnecessary on the release bases (vllm#52775 is in the
+# release) so those images have no such kernel.
 if [ "$BASE" = "v0.29" ] || [ "$BASE" = "v0.30" ]; then
-  if [ "$KV_DTYPE" != auto ]; then
-    echo "!! KV_DTYPE=$KV_DTYPE: the fp8 KV cache patch is not ported to the $BASE base yet — use the preview image (Dockerfile) for fp8 KV"; exit 1
+  if [ "$KV_DTYPE" != auto ] && [ -z "$FP8KV" ]; then
+    echo "!! KV_DTYPE=$KV_DTYPE: the fp8 KV cache patch is not in $IMAGE (no qwen38.fp8kv label) — build it with Dockerfile.v0.30 (patch 7) or use the preview image (Dockerfile) for fp8 KV"; exit 1
   fi
   [ "$PAD_M4" != 0 ] && echo "!! PAD_M4 has no effect on the $BASE base (vllm#52775 fixed the fp8 GEMM there); ignoring" && PAD_M4=0
 fi

@@ -2,15 +2,19 @@
 # to the v0.30 layout (PLE hashing in ops/ple.py + ngram_embedding.py, QSA indexer split into prefill/decode
 # paths in ops/qsa_indexer.py after vllm#54513):
 #   1 PLE mmap, 2 GB10 FLA fixes, 4 prefix-caching block_size fix, 5 exact top-k, 6 hybrid mode,
-#   8 deterministic top-k kernel, 10 reduced draft vocabulary, 12 Qwen tool preamble fix,
+#   7 fp8 KV cache on the QSA path (--kv-cache-dtype fp8_e4m3), 8 deterministic top-k kernel,
+#   10 reduced draft vocabulary, 12 Qwen tool preamble fix,
 #   13 quoted Qwen tool markers stay text, 14 MoE weight-load clone (#33).
-# Not needed here: 3 (vllm#50729), 9 (vllm#52775) and 11 (vllm#55513) are in the release. Not ported yet:
-# 7 (fp8 KV cache). 12 and 13 are the same fixes as on v0.29, rebased (src/patches/*-v030.patch).
+# Not needed here: 3 (vllm#50729), 9 (vllm#52775) and 11 (vllm#55513) are in the release. 12 and 13 are the same fixes as on v0.29, rebased (src/patches/*-v030.patch).
 #
 #   docker build -f Dockerfile.v0.30 -t qwen38-flash-dgx:v0.30 .
 #   IMAGE=qwen38-flash-dgx:v0.30 scripts/serve.sh      # serve.sh reads the image label for the op names
+#   KV_DTYPE=fp8_e4m3 IMAGE=qwen38-flash-dgx:v0.30 scripts/serve.sh   # ~1.9x KV pool (patch 7; the label below lets serve.sh accept it)
 FROM vllm/vllm-openai:v0.30.0
 LABEL qwen38.base=v0.30
+# Patch 7 is in this build: the fp8_e4m3 KV cache is wired on the QSA path.
+# serve.sh accepts KV_DTYPE=fp8_e4m3 only for images carrying this label.
+LABEL qwen38.fp8kv=1
 ARG SP=/usr/local/lib/python3.12/dist-packages
 ARG PKG=${SP}/vllm/models/qwen4_exp/nvidia
 ARG PLE=${PKG}/ngram_embedding.py
@@ -49,6 +53,14 @@ RUN cp ${MO} ${MO}.orig \
  && sed -i 's/^from \. import model$/from . import model\nfrom vllm_fp8_hybrid_modelopt import excluded_quant_config as _fp8_hybrid_excluded/' ${QSA} \
  && grep -q "_fp8_hybrid_excluded(quant_config)" ${QSA} && grep -q "^from vllm_fp8_hybrid_modelopt import" ${QSA} \
  && python3 -c "import ast; ast.parse(open('${QSA}').read()); print('qsa.py hooked OK')"
+
+# --- 7. fp8_e4m3 KV cache on the QSA path (--kv-cache-dtype fp8_e4m3) -------------------
+# Same patch as on the preview base; the script auto-detects the qwen4_exp module rename and
+# carries the v0.30 anchor variants (split-K decode kernel, JIT warmup, split-based cache view).
+# Inert with --kv-cache-dtype auto (the Triton branch is compiled out). ~1.9x KV pool,
+# 1M context on one box, at a speed and quality cost — see README before using it.
+COPY src/patch_qsa_fp8_kv.py /tmp/patch_qsa_fp8_kv.py
+RUN python3 /tmp/patch_qsa_fp8_kv.py ${SP} && rm /tmp/patch_qsa_fp8_kv.py
 
 # --- 8. Deterministic persistent_topk kernel (@jschmied, vllm#55122), built with the image's nvcc ---
 # v0.30 changed the stock kernel (vllm#54110 low-smem fallback, vllm#56346 sampled filtering): whether GB10

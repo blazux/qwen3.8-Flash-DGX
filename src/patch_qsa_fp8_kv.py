@@ -7,30 +7,53 @@ vLLM a DEJA pose toute la plomberie de quantisation du cache pour cette couche :
 `get_kv_cache_spec` transmet `kv_quant_mode`, `set_default_quant_scales` enregistre
 `_k_scale`/`_v_scale`, l'allocation et l'ECRITURE passent par le chemin generique
 du cœur. Le seul trou est la LECTURE : les noyaux Triton chargent le cache en
-supposant du bf16, et cinq gardes refusent tout le reste plutot que de lire de
+supposant du bf16, et les gardes refusent tout le reste plutot que de lire de
 travers.
 
 Ce patch ajoute la dequantisation a la lecture et leve les gardes. Il est INERTE
-tant que `--kv-cache-dtype` vaut `auto`/`bfloat16` : `FP8_KV` est alors faux, la
-branche de dequantisation est eliminee a la compilation Triton, et l'image se
+tant que `--kv-cache-dtype` vaut `auto`/`bfloat16` : `KV_QUANT_MODE` est alors 0,
+la branche de dequantisation est eliminee a la compilation Triton, et l'image se
 comporte EXACTEMENT comme l'amont.
+
+DEUX BASES : preview (qwen3_8_flash_next) et releases v0.29/v0.30 (qwen4_exp)
+-----------------------------------------------------------------------------
+Le module s'appelait `qwen3_8_flash_next` dans l'image preview et a ete renomme
+`qwen4_exp` dans les releases vLLM >= 0.29. Les deux emplacements sont tries, le
+premier trouve gagne. Sur la base preview, chaque ancre est vue exactement une
+fois et le script se comporte comme la version qui a construit v0916/v0925
+(les paires avant/apres du chemin preview sont verbatim identiques — prouve par
+extraction AST, voir docs). Sur v0.30, la plupart des ancres sont identiques ;
+celles dont la forme a change ont une variante et le script exige qu'exactement
+UNE des deux formes soit vue — jamais zero, jamais les deux — donc aucune
+substitution silencieuse n'est possible.
+
+Ce qui change sur v0.30 (outre les noms) :
+ - le noyau MQA du selecteur de blocs a quitte ops/qsa.py pour
+   ops/qsa_indexer.py et lit deja le dtype compresse nativement ; son cache est
+   pilote par `indexer_kv_dtype`, plus par `--kv-cache-dtype` : les points 3/4/9/19
+   du chemin preview n'ont plus de cible et sont sautes.
+ - le noyau decode est passe en split-K : `TOPK`/`NUM_TILES`/`NUM_SPLITS` sont des
+   constexpr, la largeur est `selection_width`, et le bloc N est choisi dans
+   `_select_config` (ici 32/64, deja plus petits que sur la preview). La reduction
+   du bloc sous quantification se fait donc apres l'appel, avec `num_tiles`
+   recalcule.
+ - le JIT-warmup (`warmup_qsa_sparse_paged_attention`) lance le meme noyau et
+   doit recevoir les nouveaux arguments, sinon la signature ne correspond plus.
 
 POURQUOI REMONTER EN BF16 ET NON EN FP32
 -----------------------------------------
-MiaAI-Lab, qui a fait le meme travail cote SGLang, remonte K/V en fp32 : « two QSA
-paths upcast K/V loads to fp32 in-kernel (q stays bf16) », SM121 ne sachant pas
-faire de `dot` en fp8. Remonter en bf16 coute deux fois moins de registres -- donc
-une meilleure occupancy, ce qui compte sur un noyau memory-bound -- au prix d'un
-arrondi supplementaire apres mise a l'echelle. PERSONNE n'a publie la comparaison
-des deux. On commence par bf16 et on MESURE ; `QSA_FP8_UPCAST_FP32=1` bascule sur
-l'autre variante sans rebuild pour pouvoir trancher.
+MiaAI-Lab, qui a fait le meme travail cote SGLang, remonte K/V en fp32. Remonter
+au dtype de la requete (bf16) coute deux fois moins de registres et c'est le
+choix d'UPSTREAM VLLM lui-meme (`_cast_kv_tile` : `return (data.to(tl.float32) *
+tl.load(tensor_scale)).to(Q.dtype)`). Suivre vLLM ici, c'est heriter de ses
+corrections plutot que d'en diverger.
 
-CE QUI N'EST PAS COUVERT
-------------------------
-Le cache COMPRESSE lu par `_qsa_mqa_paged_kernel` (forme [pages, page_size, 1,
-head_dim]) est distinct du cache KV principal ; rien ne garantit qu'il suive le
-meme dtype. Il est patche par prudence, sous son propre drapeau : si son dtype ne
-bouge pas, la branche reste morte et le noyau est inchange.
+ECHELLES : le wrapper accepte `k_scale`/`v_scale` EN OPTION ; sans eux, la scale
+vaut 1.0 et le cache est lu tel quel — exactement le comportement verifie des
+images preview (l'owner ne les transmet pas, `set_default_quant_scales`
+enregistre 1.0, le checkpoint NVFP4 n'en publie pas). Un checkpoint qui publie
+une autre echelle demanderait a cabler `layer._k_scale` dans l'owner ; ce n'est
+le cas d'aucun checkpoint teste ici.
 
 NVFP4 n'est pas traite ici : il ajoute un format packe et des echelles fp8
 imbriquees. Le fp8-e4m3 valide d'abord la chaine complete.
@@ -47,19 +70,21 @@ Usage :
     python3 patch_qsa_fp8_kv.py <site-packages>
 """
 import ast
+import os
 import sys
 
 SP = sys.argv[1] if len(sys.argv) > 1 else sys.exit("usage: patch_qsa_fp8_kv.py <site-packages>")
-BASE = f"{SP}/vllm/models/qwen3_8_flash_next/nvidia"
+
+# Nom du module : qwen3_8_flash_next sur la preview, qwen4_exp sur les releases
+# vLLM >= 0.29 (renommage amont). Les deux bases ont la meme arborescence.
+_CANDIDATES = ("qwen3_8_flash_next", "qwen4_exp")
+MODULE = next((m for m in _CANDIDATES if os.path.isdir(f"{SP}/vllm/models/{m}/nvidia")), None)
+if MODULE is None:
+    sys.exit(f"patch_qsa_fp8_kv: ni {' ni '.join(_CANDIDATES)} sous {SP}/vllm/models/")
+BASE = f"{SP}/vllm/models/{MODULE}/nvidia"
 OPS = f"{BASE}/ops/qsa.py"
 OWNER = f"{BASE}/qsa.py"
-
-# Variante de dequantisation. bf16 par defaut (registres, occupancy) ; fp32 pour
-# reproduire le choix de MiaAI-Lab si la precision bf16 se revele insuffisante.
-# Plus de variante fp32 : `_cast_kv_tile` redescend au dtype de la requete, et
-# c'est le choix d'UPSTREAM VLLM lui-meme (`return (data.to(tl.float32) *
-# tl.load(tensor_scale)).to(Q.dtype)`). MiaAI-Lab monte en fp32 cote SGLang ;
-# suivre vLLM ici, c'est heriter de ses corrections plutot que d'en diverger.
+IS_V030 = MODULE == "qwen4_exp"
 
 
 def remplacer(texte: str, avant: str, apres: str, quoi: str) -> str:
@@ -68,6 +93,25 @@ def remplacer(texte: str, avant: str, apres: str, quoi: str) -> str:
     return texte.replace(avant, apres)
 
 
+def remplacer_au_choix(texte: str, avant: str, apres: str, quoi: str,
+                       avant_v030: str, quoi2: str) -> str:
+    """`avant` (forme preview) ou `avant_v030` (forme v0.29+) doit apparaitre
+    exactement une fois, jamais les deux. La substitution est la meme que celle
+    que la forme preview produit, donc un futur amont qui fusionnerait les deux
+    spellings echoue ici plutot que de patcher a moitie."""
+    n1, n2 = texte.count(avant), texte.count(avant_v030)
+    if n1 == 1 and n2 == 0:
+        return texte.replace(avant, apres)
+    if n1 == 0 and n2 == 1:
+        return texte.replace(avant_v030, apres)
+    raise AssertionError(
+        f"ancre '{quoi}'/'{quoi2}' vues ({n1}, {n2}) -- attendu (1,0) ou (0,1), "
+        "l'amont a bouge"
+    )
+
+
+print(f"patch_qsa_fp8_kv: module {MODULE} ({'release v0.29+' if IS_V030 else 'preview'})")
+
 # ---------------------------------------------------------------- ops/qsa.py
 ops = open(OPS).read()
 
@@ -75,9 +119,8 @@ ops = open(OPS).read()
 #    seconde. `_cast_kv_tile` (v1/attention/ops/triton_unified_attention.py) fait
 #    deja exactement ce travail pour l'attention unifiee, gere les quatre modes
 #    (NONE, FP8 per-tensor, INT8/FP8 per-token-head) ET le cas ou la requete est
-#    elle-meme en fp8 -- que cette version-ci avait oublie. Dupliquer la formule
-#    aurait cree une seconde verite qui derive : c'est precisement le defaut que
-#    ce depot traque partout ailleurs.
+#    elle-meme en fp8. Dupliquer la formule aurait cree une seconde verite qui
+#    derive : c'est precisement le defaut que ce depot traque partout ailleurs.
 ops = remplacer(ops,
     "from vllm.triton_utils import HAS_TRITON, tl, triton",
     "from vllm.triton_utils import HAS_TRITON, tl, triton\n"
@@ -85,8 +128,9 @@ ops = remplacer(ops,
     "import du helper canonique")
 
 # 1. Noyau DECODE : signature. Les echelles sont des pointeurs (tenseurs 0-dim
-#    cote Python) ; `FP8_KV` est une constexpr, donc la branche disparait a la
-#    compilation quand elle est fausse.
+#    cote Python) ; `KV_QUANT_MODE` est une constexpr, donc la branche disparait
+#    a la compilation quand elle est fausse. L'ancre est identique sur les deux
+#    bases (sur v0.30, PAGE_SIZE suit TOPK, ce qui ne change rien au motif).
 ops = remplacer(ops,
     "    num_requests,\n    TOPK: tl.constexpr,",
     "    num_requests,\n"
@@ -109,22 +153,25 @@ ops = remplacer(ops,
     "        # Scaling scores avoids re-quantizing a scaled query to BF16.",
     "dequantisation du noyau decode")
 
-# 3. Noyau MQA (cache COMPRESSE, distinct du KV principal) : signature.
-ops = remplacer(ops,
-    "    score_divisor,\n    PAGE_SIZE: tl.constexpr,",
-    "    score_divisor,\n"
-    "    kc_scale_ptr,\n"
-    "    KC_QUANT_MODE: tl.constexpr,\n"
-    "    PAGE_SIZE: tl.constexpr,",
-    "signature du noyau mqa")
+if not IS_V030:
+    # 3. Noyau MQA (cache COMPRESSE, distinct du KV principal) : signature.
+    #    Sur v0.30 ce noyau vit dans ops/qsa_indexer.py et lit deja son dtype
+    #    compresse nativement : rien a y porter (voir le docstring).
+    ops = remplacer(ops,
+        "    score_divisor,\n    PAGE_SIZE: tl.constexpr,",
+        "    score_divisor,\n"
+        "    kc_scale_ptr,\n"
+        "    KC_QUANT_MODE: tl.constexpr,\n"
+        "    PAGE_SIZE: tl.constexpr,",
+        "signature du noyau mqa")
 
-# 4. Noyau MQA : dequantisation. Il ne lit que les cles (c'est le selecteur de
-#    blocs), pas les valeurs.
-ops = remplacer(ops,
-    "        scores = tl.dot(keys, query, out_dtype=tl.float32)",
-    "        keys = _cast_kv_tile(keys, query, kc_scale_ptr, KC_QUANT_MODE)\n"
-    "        scores = tl.dot(keys, query, out_dtype=tl.float32)",
-    "dequantisation du noyau mqa")
+    # 4. Noyau MQA : dequantisation. Il ne lit que les cles (c'est le selecteur de
+    #    blocs), pas les valeurs.
+    ops = remplacer(ops,
+        "        scores = tl.dot(keys, query, out_dtype=tl.float32)",
+        "        keys = _cast_kv_tile(keys, query, kc_scale_ptr, KC_QUANT_MODE)\n"
+        "        scores = tl.dot(keys, query, out_dtype=tl.float32)",
+        "dequantisation du noyau mqa")
 
 # 5. Le garde du wrapper decode. Il exigeait l'egalite des trois dtypes ; on
 #    autorise un CACHE fp8 avec une REQUETE bf16, ce qui est precisement le point.
@@ -143,14 +190,35 @@ ops = remplacer(ops,
 
 # 6. Passage des echelles au lancement du noyau decode. Absentes, on retombe sur
 #    des echelles neutres : le patch reste alors un no-op numerique.
-ops = remplacer(ops,
+ops = remplacer_au_choix(ops,
     "        block_table.shape[0],\n        TOPK=logical_indices.shape[1],",
     "        block_table.shape[0],\n"
     "        _k_scale_t,\n"
     "        _v_scale_t,\n"
     "        KV_QUANT_MODE=_kv_mode,\n"
     "        TOPK=logical_indices.shape[1],",
-    "lancement du noyau decode")
+    "lancement du noyau decode",
+    "        block_table.shape[0],\n        TOPK=selection_width,",
+    "lancement du noyau decode (v0.30, split-K)")
+
+if IS_V030:
+    # 6b. Le JIT-warmup lance le meme noyau : il doit recevoir les deux pointeurs
+    #     d'echelle et la constexpr, sinon la signature ne correspond plus et le
+    #     warmup du boot explose. Mode 0 : le warmup compile la specialisation
+    #     bf16 ; la specialisation fp8 se compile au premier vrai passage.
+    ops = remplacer(ops,
+        "    warmed = []",
+        "    _warmup_scale = TritonWarmupTensor(torch.float32)\n"
+        "    warmed = []",
+        "echelle factice du warmup (v0.30)")
+    ops = remplacer(ops,
+        "            num_requests,\n            TOPK=selection_width,",
+        "            num_requests,\n"
+        "            _warmup_scale,\n"
+        "            _warmup_scale,\n"
+        "            KV_QUANT_MODE=0,\n"
+        "            TOPK=selection_width,",
+        "lancement du warmup decode (v0.30)")
 
 # 7. Les tenseurs d'echelle, materialises juste avant le lancement.
 ops = remplacer(ops,
@@ -164,7 +232,7 @@ ops = remplacer(ops,
 # 8. Signature publique du wrapper decode. Les echelles sont OPTIONNELLES : sans
 #    elles, `_k_scale_t` retombe sur 1.0 et le patch est un no-op numerique, ce
 #    qui garantit que tout appelant non modifie continue de fonctionner.
-ops = remplacer(ops,
+ops = remplacer_au_choix(ops,
     "    token_to_req: torch.Tensor,\n"
     "    out: torch.Tensor | None = None,\n"
     ") -> torch.Tensor:",
@@ -173,70 +241,89 @@ ops = remplacer(ops,
     "    k_scale: torch.Tensor | None = None,\n"
     "    v_scale: torch.Tensor | None = None,\n"
     ") -> torch.Tensor:",
-    "signature du wrapper decode")
+    "signature du wrapper decode",
+    "    out: torch.Tensor | None = None,\n"
+    "    *,\n"
+    "    output_gate: torch.Tensor,\n"
+    ") -> torch.Tensor:",
+    "signature du wrapper decode (v0.30, gate keyword-only)")
 
-# 19. LE CACHE DU SELECTEUR DE BLOCS, reinterpretation manquante.
-#
-# `qsa_mqa_paged` lit le cache de l'INDEXEUR (`self.indexer.raw_key_cache`), pas
-# le cache KV principal. Ce cache-la suit aussi `kv_cache_dtype` et arrive donc en
-# `uint8` -- non reinterprete, puisque le `.view()` de `forward_qsa` ne porte que
-# sur le cache principal.
-#
-# Consequence, si on ne fait rien : `KC_QUANT_MODE` retombe a 0, le noyau lit des
-# OCTETS comme des flottants, et la selection des blocs devient aberrante. Comme
-# cette selection decide QUELS blocs l'attention va regarder, la sortie diverge
-# des le PREMIER jeton -- exactement ce qui a ete mesure le 2026-08-30 (11 sorties
-# sur 12 fausses, plusieurs au rang 0), alors meme que le chemin de decode etait
-# correct de bout en bout.
-ops = remplacer(ops,
-    "    _validate_mqa(q)",
-    "    # The block selector reads the indexer cache, a SEPARATE tensor from the\n"
-    "    # main KV cache that follows the same dtype. Left as uint8 the kernel\n"
-    "    # would read integers and pick arbitrary blocks.\n"
-    "    if k_cache.dtype == torch.uint8:\n"
-    "        k_cache = k_cache.view(torch.float8_e4m3fn)\n"
-    "    _validate_mqa(q)",
-    "reinterpretation du cache de l'indexeur")
+if not IS_V030:
+    # 19. LE CACHE DU SELECTEUR DE BLOCS, reinterpretation manquante (preview).
+    #
+    # `qsa_mqa_paged` lit le cache de l'INDEXEUR (`self.indexer.raw_key_cache`),
+    # pas le cache KV principal. Sur la preview ce cache suit aussi
+    # `kv_cache_dtype` et arrive donc en `uint8` non reinterprete : le noyau lit
+    # des OCTETS comme des flottants, la selection des blocs devient aberrante et
+    # la sortie diverge des le PREMIER jeton (mesure du 2026-08-30 : 11 sorties
+    # sur 12 fausses) alors meme que le chemin de decode est correct.
+    #
+    # Sur v0.30 : sans cible (voir le docstring) — le selecteur a son propre
+    # cache, dtype pilote par `indexer_kv_dtype`, jamais uint8.
+    ops = remplacer(ops,
+        "    _validate_mqa(q)",
+        "    # The block selector reads the indexer cache, a SEPARATE tensor from the\n"
+        "    # main KV cache that follows the same dtype. Left as uint8 the kernel\n"
+        "    # would read integers and pick arbitrary blocks.\n"
+        "    if k_cache.dtype == torch.uint8:\n"
+        "        k_cache = k_cache.view(torch.float8_e4m3fn)\n"
+        "    _validate_mqa(q)",
+        "reinterpretation du cache de l'indexeur")
 
-# 9. Lancement du noyau mqa : echelle neutre tant que le cache compresse reste bf16.
-ops = remplacer(ops,
-    "        float(score_divisor),\n        PAGE_SIZE=k_cache.shape[1],",
-    "        float(score_divisor),\n"
-    "        torch.ones((), dtype=torch.float32, device=q.device),\n"
-    "        1 if k_cache.dtype == torch.float8_e4m3fn else 0,\n"
-    "        PAGE_SIZE=k_cache.shape[1],",
-    "lancement du noyau mqa")
+    # 9. Lancement du noyau mqa : echelle neutre tant que le cache compresse reste bf16.
+    ops = remplacer(ops,
+        "        float(score_divisor),\n        PAGE_SIZE=k_cache.shape[1],",
+        "        float(score_divisor),\n"
+        "        torch.ones((), dtype=torch.float32, device=q.device),\n"
+        "        1 if k_cache.dtype == torch.float8_e4m3fn else 0,\n"
+        "        PAGE_SIZE=k_cache.shape[1],",
+        "lancement du noyau mqa")
 
-# 18. LA MEMOIRE PARTAGEE : reduire le bloc quand le cache est quantifie.
-#
-# `_cast_kv_tile` materialise une tuile fp32 (`data.to(tl.float32)`) avant de
-# redescendre au dtype de la requete. Cette tuile est DEUX FOIS plus large que le
-# bf16 d'origine, sur K et sur V. Mesure au boot :
-#
-#     triton.runtime.errors.OutOfResources: out of resource: shared memory,
-#     Required: 106496, Hardware limit: 101376
-#
-# Le GB10 plafonne a 99 KiB de memoire partagee -- la meme limite que le patch FLA
-# amont encode deja (`DEFAULT = 101376  # spark-fla-shmem`). Le noyau en demandait
-# 5 120 de trop.
-#
-# On halve donc le bloc N quand le cache est quantifie, ce que le message d'erreur
-# de Triton suggere explicitement. Le cout est un peu de parallelisme par
-# programme ; le benefice est que le noyau TIENT. C'est aussi le prix reel du fp8
-# sur cette machine, a garder en tete au moment de juger le debit.
-ops = remplacer(ops,
-    "    num_tiles = triton.cdiv(logical_indices.shape[1], block_n)",
-    "    if _kv_mode != 0:\n"
-    "        # _cast_kv_tile materialises an fp32 tile, doubling shared memory for\n"
-    "        # K and V. sm_121 caps at 101376 bytes and the kernel asked for\n"
-    "        # 106496; halving the N block fits.\n"
-    "        block_n = max(16, block_n // 2)\n"
-    "    num_tiles = triton.cdiv(logical_indices.shape[1], block_n)",
-    "bloc N reduit sous quantisation")
+    # 18. LA MEMOIRE PARTAGEE : reduire le bloc quand le cache est quantifie.
+    #
+    # `_cast_kv_tile` materialise une tuile fp32 (`data.to(tl.float32)`) avant de
+    # redescendre au dtype de la requete. Cette tuile est DEUX FOIS plus large
+    # que le bf16 d'origine, sur K et sur V. Mesure au boot sur la preview :
+    #
+    #     triton.runtime.errors.OutOfResources: out of resource: shared memory,
+    #     Required: 106496, Hardware limit: 101376
+    #
+    # Le GB10 plafonne a 99 KiB de memoire partagee -- la meme limite que le
+    # patch FLA amont encode deja (`DEFAULT = 101376  # spark-fla-shmem`). On
+    # halve le bloc N quand le cache est quantifie.
+    ops = remplacer(ops,
+        "    num_tiles = triton.cdiv(logical_indices.shape[1], block_n)",
+        "    if _kv_mode != 0:\n"
+        "        # _cast_kv_tile materialises an fp32 tile, doubling shared memory for\n"
+        "        # K and V. sm_121 caps at 101376 bytes and the kernel asked for\n"
+        "        # 106496; halving the N block fits.\n"
+        "        block_n = max(16, block_n // 2)\n"
+        "    num_tiles = triton.cdiv(logical_indices.shape[1], block_n)",
+        "bloc N reduit sous quantisation")
+else:
+    # 18b. Meme correction sur v0.30, mais le bloc N vient de `_select_config`
+    #      (32/64) et `num_tiles` est calcule dans l'appel : on halve apres
+    #      l'appel et on recalcule `num_tiles`. Halver ne fait qu'augmenter le
+    #      nombre de tuiles, donc `num_splits <= num_tiles` reste vrai.
+    ops = remplacer(ops,
+        "    block_n, partial_warps, num_tiles, num_splits = _select_config(\n"
+        "        q.shape[0], k_cache.shape[2], use_prefill_config, selection_width\n"
+        "    )",
+        "    block_n, partial_warps, num_tiles, num_splits = _select_config(\n"
+        "        q.shape[0], k_cache.shape[2], use_prefill_config, selection_width\n"
+        "    )\n"
+        "    if _kv_mode != 0:\n"
+        "        # _cast_kv_tile materialises an fp32 tile, doubling shared memory for\n"
+        "        # K and V. sm_121 caps at 101376 bytes; halving the N block fits\n"
+        "        # (same correction as on the preview base, applied post-select).\n"
+        "        block_n = max(16, block_n // 2)\n"
+        "        num_tiles = triton.cdiv(selection_width, block_n)",
+        "bloc N reduit sous quantisation (v0.30)")
 
 ast.parse(ops)
 open(OPS, "w").write(ops)
-print("ops/qsa.py : noyaux decode + mqa dequantifiants, gardes de dtype leves")
+print("ops/qsa.py : noyau decode dequantifiant, gardes de dtype leves"
+      + ("" if IS_V030 else " + mqa"))
 
 # -------------------------------------------------------------------- qsa.py
 owner = open(OWNER).read()
@@ -252,9 +339,10 @@ owner = remplacer(owner,
     '    ]',
     "dtypes declares supportes")
 
-# 11..13. Les trois gardes DECLARATIFS. Ils ne protegeaient rien une fois les
-#         noyaux capables ; le seul garde utile etait celui du wrapper (n.5).
-owner = remplacer(owner,
+# 11..13. Les gardes DECLARATIFS. Ils ne protegeaient rien une fois les noyaux
+#         capables ; le seul garde utile etait celui du wrapper (n.5). Sur les
+#         releases le message est sur une ligne, sur la preview sur trois.
+owner = remplacer_au_choix(owner,
     '        if self.kv_cache_dtype not in ("auto", "bfloat16"):\n'
     "            raise NotImplementedError(\n"
     '                "Qwen3.8-Flash-Next QSA requires a BF16 main KV cache"\n'
@@ -264,9 +352,12 @@ owner = remplacer(owner,
     '                f"Qwen3.8-Flash-Next QSA: {self.kv_cache_dtype} is not supported "\n'
     '                "(bf16 and fp8_e4m3 are)"\n'
     "            )",
-    "garde d'init")
+    "garde d'init",
+    '        if self.kv_cache_dtype not in ("auto", "bfloat16"):\n'
+    '            raise NotImplementedError("Qwen4Exp QSA requires a BF16 main KV cache")',
+    "garde d'init (v0.30)")
 
-owner = remplacer(owner,
+owner = remplacer_au_choix(owner,
     "        if key_cache.dtype != torch.bfloat16 or query.dtype != torch.bfloat16:\n"
     '            raise NotImplementedError("Qwen3.8-Flash-Next QSA requires BF16 Q/K/V")',
     "        if query.dtype != torch.bfloat16:\n"
@@ -279,9 +370,12 @@ owner = remplacer(owner,
     "            raise NotImplementedError(\n"
     '                f"Qwen3.8-Flash-Next QSA: cache dtype {key_cache.dtype} is not supported"\n'
     "            )",
-    "garde d'entree du noyau")
+    "garde d'entree du noyau",
+    "        if key_cache.dtype != torch.bfloat16 or query.dtype != torch.bfloat16:\n"
+    '            raise NotImplementedError("Qwen4Exp QSA requires BF16 Q/K/V")',
+    "garde d'entree du noyau (v0.30)")
 
-owner = remplacer(owner,
+owner = remplacer_au_choix(owner,
     "        if self.kv_cache_torch_dtype != torch.bfloat16:\n"
     "            raise NotImplementedError(\n"
     '                "Qwen3.8-Flash-Next QSA requires BF16 cache storage"\n'
@@ -299,21 +393,18 @@ owner = remplacer(owner,
     '                f"Qwen3.8-Flash-Next QSA: storage dtype {self.kv_cache_torch_dtype} "\n'
     '                "is not supported"\n'
     "            )",
-    "garde de stockage")
+    "garde de stockage",
+    '        if self.kv_cache_torch_dtype != torch.bfloat16:\n'
+    '            raise NotImplementedError("Qwen4Exp QSA requires BF16 cache storage")',
+    "garde de stockage (v0.30)")
 
 # 15. LE GARDE RATE AU PREMIER PASSAGE, et qui a fait echouer le boot.
 #
-# Ce fichier porte SEPT gardes, pas cinq. Deux vivent dans une AUTRE classe --
-# `Qwen3_8FlashNextQSAAttention.__init__` -- et le premier inventaire ne les avait
-# pas vus. Celui-ci teste `cache_config.cache_dtype` la ou celui de la l.108 teste
-# `self.kv_cache_dtype` : meme message d'erreur, texte different, donc l'assertion
-# `count == 1` du patch passait sans rien signaler. Le moteur fp8 est mort au
-# demarrage sur ce garde, avec exactement le message que le patch croyait avoir
-# leve.
-#
-# Lecon : chercher les gardes par leur MESSAGE ne suffit pas, il faut les chercher
-# par ce qu'ils TESTENT.
-owner = remplacer(owner,
+# Deux gardes vivent dans une AUTRE classe (l'attention, pas l'impl) et testent
+# `cache_config.cache_dtype` la ou ceux d'en haut testent `self.kv_cache_dtype` :
+# meme intention, texte different. Chercher les gardes par leur MESSAGE ne
+# suffit pas, il faut les chercher par ce qu'ils TESTENT.
+owner = remplacer_au_choix(owner,
     '        if cache_config.cache_dtype not in ("auto", "bfloat16"):\n'
     "            raise NotImplementedError(\n"
     '                "Qwen3.8-Flash-Next QSA requires a BF16 main KV cache"\n'
@@ -323,24 +414,24 @@ owner = remplacer(owner,
     '                f"Qwen3.8-Flash-Next QSA: cache_dtype {cache_config.cache_dtype} "\n'
     '                "is not supported (bf16 and fp8_e4m3 are)"\n'
     "            )",
-    "garde cache_config.cache_dtype (classe QSAAttention)")
+    "garde cache_config.cache_dtype (classe QSAAttention)",
+    '        if cache_config.cache_dtype not in ("auto", "bfloat16"):\n'
+    '            raise NotImplementedError("Qwen4Exp QSA requires a BF16 main KV cache")',
+    "garde cache_config.cache_dtype (v0.30)")
 
-# Le septieme garde -- `quant_config.kv_cache_scheme is not None`, « does not
-# support KV quantization » -- vise le schema declare DANS LE CHECKPOINT
-# (compressed-tensors), pas `--kv-cache-dtype`. Notre chemin ne le declenche pas ;
-# il est laisse en place plutot que leve a l'aveugle.
+# Le garde `quant_config.kv_cache_scheme is not None` (« does not support KV
+# quantization ») vise le schema declare DANS LE CHECKPOINT (compressed-tensors),
+# pas `--kv-cache-dtype`. Notre chemin ne le declenche pas ; il est laisse en
+# place plutot que leve a l'aveugle.
 
 # 17. LE GARDE DU PARENT, qui teste une capacite dont QSA NE DEPEND PAS.
 #
-# `Qwen3_8FlashNextQSAImpl` herite de `FlashAttentionImpl` et appelle
-# `super().__init__()`. Le parent refuse un cache quantifie
-# (`flash_attn.py:918`, « FlashAttention does not support fp8_e4m3 kv-cache on
-# this device ») parce que SES noyaux ne savent pas le lire sur SM121.
-#
-# Mais QSA ne calcule PAS avec les noyaux FlashAttention : il appelle
-# `qsa_sparse_paged_attention`, en Triton, et n'herite du parent que pour
-# l'infrastructure (metadonnees, plomberie de couche). Le garde est donc hors
-# sujet pour lui -- il refuse une capacite qui n'est jamais sollicitee.
+# L'impl herite de `FlashAttentionImpl` et appelle `super().__init__()`. Le
+# parent refuse un cache quantifie (« FlashAttention does not support ... »)
+# parce que SES noyaux ne savent pas le lire sur SM121. Mais QSA ne calcule PAS
+# avec les noyaux FlashAttention : il appelle `qsa_sparse_paged_attention`, en
+# Triton, et n'herite du parent que pour l'infrastructure. Le garde refuse une
+# capacite qui n'est jamais sollicitee.
 #
 # On neutralise le dtype LE TEMPS de l'init du parent, puis on le restaure.
 # `kv_cache_dtype` est le 7e parametre positionnel, d'ou les deux formes.
@@ -375,25 +466,33 @@ owner = remplacer(owner,
 # au lieu de decoder le flottant : des nombres plausibles, totalement faux -- le
 # mode de defaillance silencieux qu'on traque depuis le debut.
 #
-# vLLM resout cela par une REINTERPRETATION DE BITS sans copie, et le fait au meme
-# endroit pour l'attention unifiee (`v1/attention/backends/triton_attn.py`) :
-#
-#     if is_quantized_kv_cache(self.kv_cache_dtype) and key_cache.dtype != fp8:
-#         key_cache = key_cache.view(self.fp8_dtype)
-#
-# On reprend la meme forme, au meme moment : apres la decoupe du cache, avant le
-# garde d'entree du noyau.
-owner = remplacer(owner,
-    "        key_cache = canonicalize_singleton_dim_strides(key_cache)\n"
-    "        value_cache = canonicalize_singleton_dim_strides(value_cache)",
-    "        key_cache = canonicalize_singleton_dim_strides(key_cache)\n"
-    "        value_cache = canonicalize_singleton_dim_strides(value_cache)\n"
-    "        # uint8 holds the raw bytes of an fp8 cache: REINTERPRET them, do not\n"
-    "        # convert (same step triton_attn.py takes for unified attention).\n"
-    "        if key_cache.dtype == torch.uint8:\n"
-    "            key_cache = key_cache.view(torch.float8_e4m3fn)\n"
-    "            value_cache = value_cache.view(torch.float8_e4m3fn)",
-    "reinterpretation uint8 -> fp8")
+# vLLM resout cela par une REINTERPRETATION DE BITS sans copie, comme pour
+# l'attention unifiee (`triton_attn.py` : `key_cache.view(self.fp8_dtype)`).
+# Preview : apres la canonisation des strides. v0.30 : la decoupe du cache se
+# fait par `split` dans `forward_qsa`, sans passe canonicalize — meme placement
+# relatif : apres la decoupe, avant le garde d'entree.
+if not IS_V030:
+    owner = remplacer(owner,
+        "        key_cache = canonicalize_singleton_dim_strides(key_cache)\n"
+        "        value_cache = canonicalize_singleton_dim_strides(value_cache)",
+        "        key_cache = canonicalize_singleton_dim_strides(key_cache)\n"
+        "        value_cache = canonicalize_singleton_dim_strides(value_cache)\n"
+        "        # uint8 holds the raw bytes of an fp8 cache: REINTERPRET them, do not\n"
+        "        # convert (same step triton_attn.py takes for unified attention).\n"
+        "        if key_cache.dtype == torch.uint8:\n"
+        "            key_cache = key_cache.view(torch.float8_e4m3fn)\n"
+        "            value_cache = value_cache.view(torch.float8_e4m3fn)",
+        "reinterpretation uint8 -> fp8")
+else:
+    owner = remplacer(owner,
+        "        key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)",
+        "        key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)\n"
+        "        # uint8 holds the raw bytes of an fp8 cache: REINTERPRET them, do not\n"
+        "        # convert (same step triton_attn.py takes for unified attention).\n"
+        "        if key_cache.dtype == torch.uint8:\n"
+        "            key_cache = key_cache.view(torch.float8_e4m3fn)\n"
+        "            value_cache = value_cache.view(torch.float8_e4m3fn)",
+        "reinterpretation uint8 -> fp8 (decoupe par split, v0.30)")
 
 ast.parse(owner)
 open(OWNER, "w").write(owner)

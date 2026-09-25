@@ -94,16 +94,17 @@ def remplacer(texte: str, avant: str, apres: str, quoi: str) -> str:
 
 
 def remplacer_au_choix(texte: str, avant: str, apres: str, quoi: str,
-                       avant_v030: str, quoi2: str) -> str:
+                       avant_v030: str, apres_v030: str, quoi2: str) -> str:
     """`avant` (forme preview) ou `avant_v030` (forme v0.29+) doit apparaitre
-    exactement une fois, jamais les deux. La substitution est la meme que celle
-    que la forme preview produit, donc un futur amont qui fusionnerait les deux
-    spellings echoue ici plutot que de patcher a moitie."""
+    exactement une fois, jamais les deux — donc aucune substitution
+    silencieuse n'est possible. Chaque base a SON texte de remplacement :
+    les deux formes ne sont pas toujours interchangeables (lancement et
+    signature du wrapper different vraiment)."""
     n1, n2 = texte.count(avant), texte.count(avant_v030)
     if n1 == 1 and n2 == 0:
         return texte.replace(avant, apres)
     if n1 == 0 and n2 == 1:
-        return texte.replace(avant_v030, apres)
+        return texte.replace(avant_v030, apres_v030)
     raise AssertionError(
         f"ancre '{quoi}'/'{quoi2}' vues ({n1}, {n2}) -- attendu (1,0) ou (0,1), "
         "l'amont a bouge"
@@ -199,6 +200,13 @@ ops = remplacer_au_choix(ops,
     "        TOPK=logical_indices.shape[1],",
     "lancement du noyau decode",
     "        block_table.shape[0],\n        TOPK=selection_width,",
+    # v0.30 : TOPK reste selection_width (logical_indices.shape[1] serait
+    # selection_width+1, la colonne de comptage comprise — silencieusement faux).
+    "        block_table.shape[0],\n"
+    "        _k_scale_t,\n"
+    "        _v_scale_t,\n"
+    "        KV_QUANT_MODE=_kv_mode,\n"
+    "        TOPK=selection_width,",
     "lancement du noyau decode (v0.30, split-K)")
 
 if IS_V030:
@@ -243,6 +251,13 @@ ops = remplacer_au_choix(ops,
     ") -> torch.Tensor:",
     "signature du wrapper decode",
     "    out: torch.Tensor | None = None,\n"
+    "    *,\n"
+    "    output_gate: torch.Tensor,\n"
+    ") -> torch.Tensor:",
+    # v0.30 : gate keyword-only. Les echelles suivent `out`, avant le `*`.
+    "    out: torch.Tensor | None = None,\n"
+    "    k_scale: torch.Tensor | None = None,\n"
+    "    v_scale: torch.Tensor | None = None,\n"
     "    *,\n"
     "    output_gate: torch.Tensor,\n"
     ") -> torch.Tensor:",
@@ -355,6 +370,8 @@ owner = remplacer_au_choix(owner,
     "garde d'init",
     '        if self.kv_cache_dtype not in ("auto", "bfloat16"):\n'
     '            raise NotImplementedError("Qwen4Exp QSA requires a BF16 main KV cache")',
+    '        if self.kv_cache_dtype not in ("auto", "bfloat16", "fp8", "fp8_e4m3"):\n'
+    '            raise NotImplementedError("QSA: fp8_e4m3 is supported (patched)")',
     "garde d'init (v0.30)")
 
 owner = remplacer_au_choix(owner,
@@ -373,6 +390,16 @@ owner = remplacer_au_choix(owner,
     "garde d'entree du noyau",
     "        if key_cache.dtype != torch.bfloat16 or query.dtype != torch.bfloat16:\n"
     '            raise NotImplementedError("Qwen4Exp QSA requires BF16 Q/K/V")',
+    "        if query.dtype != torch.bfloat16:\n"
+    '            raise NotImplementedError("QSA requires a BF16 query")\n'
+    "        if key_cache.dtype not in (\n"
+    "            torch.bfloat16,\n"
+    "            torch.float8_e4m3fn,\n"
+    "            torch.uint8,\n"
+    "        ):\n"
+    "            raise NotImplementedError(\n"
+    '                f"QSA: cache dtype {key_cache.dtype} is not supported"\n'
+    "            )",
     "garde d'entree du noyau (v0.30)")
 
 owner = remplacer_au_choix(owner,
@@ -396,6 +423,15 @@ owner = remplacer_au_choix(owner,
     "garde de stockage",
     '        if self.kv_cache_torch_dtype != torch.bfloat16:\n'
     '            raise NotImplementedError("Qwen4Exp QSA requires BF16 cache storage")',
+    "        if self.kv_cache_torch_dtype not in (\n"
+    "            torch.bfloat16,\n"
+    "            torch.float8_e4m3fn,\n"
+    "            torch.uint8,\n"
+    "        ):\n"
+    "            raise NotImplementedError(\n"
+    '                f"QSA: storage dtype {self.kv_cache_torch_dtype} "\n'
+    '                "is not supported"\n'
+    "            )",
     "garde de stockage (v0.30)")
 
 # 15. LE GARDE RATE AU PREMIER PASSAGE, et qui a fait echouer le boot.
@@ -417,6 +453,8 @@ owner = remplacer_au_choix(owner,
     "garde cache_config.cache_dtype (classe QSAAttention)",
     '        if cache_config.cache_dtype not in ("auto", "bfloat16"):\n'
     '            raise NotImplementedError("Qwen4Exp QSA requires a BF16 main KV cache")',
+    '        if cache_config.cache_dtype not in ("auto", "bfloat16", "fp8", "fp8_e4m3"):\n'
+    '            raise NotImplementedError("QSA: fp8_e4m3 is supported (patched)")',
     "garde cache_config.cache_dtype (v0.30)")
 
 # Le garde `quant_config.kv_cache_scheme is not None` (« does not support KV

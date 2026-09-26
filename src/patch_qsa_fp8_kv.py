@@ -39,6 +39,9 @@ Ce qui change sur v0.30 (outre les noms) :
    recalcule.
  - le JIT-warmup (`warmup_qsa_sparse_paged_attention`) lance le meme noyau et
    doit recevoir les nouveaux arguments, sinon la signature ne correspond plus.
+   Il doit aussi compiler la specialisation du MODE REEL (point 6c) : figee a 0,
+   la variante fp8 ne se compilerait qu'au premier vrai lancement, qui peut se
+   faire sous capture du graphe CUDA — ou la compilation Triton est fatale.
 
 POURQUOI REMONTER EN BF16 ET NON EN FP32
 -----------------------------------------
@@ -212,19 +215,45 @@ ops = remplacer_au_choix(ops,
 if IS_V030:
     # 6b. Le JIT-warmup lance le meme noyau : il doit recevoir les deux pointeurs
     #     d'echelle et la constexpr, sinon la signature ne correspond plus et le
-    #     warmup du boot explose. Mode 0 : le warmup compile la specialisation
-    #     bf16 ; la specialisation fp8 se compile au premier vrai passage.
+    #     warmup du boot explose. L'echelle est factice (le warmup ne lance rien,
+    #     il compile) ; le MODE, lui, doit etre reel — voir 6c.
     ops = remplacer(ops,
         "    warmed = []",
         "    _warmup_scale = TritonWarmupTensor(torch.float32)\n"
         "    warmed = []",
         "echelle factice du warmup (v0.30)")
+
+    # 6c. LE MODE REEL AU WARMUP (Vorbehalt du review Hyperion-II).
+    #
+    # Le warmup recoit le VRAI cache (`owner.kv_cache`). Sous fp8, le cœur
+    # l allooue en uint8 et le runtime le reinterprete en fp8 juste avant le
+    # noyau ; le dtype du pointeur entre dans la specialisation Triton. Fixe a
+    # 0 avec un cache uint8, le warmup ne compilait donc AUCUNE des deux
+    # specialisations que le premier vrai lancement reclame : la compilation
+    # JIT tomberait sur ce premier lancement — et si c'est une capture de graphe
+    # CUDA, le boot meurt (pas de compilation sous capture). On reprend ici la
+    # REGLE EXACTE du wrapper decode : uint8 (ou fp8) -> mode 1 et reinterpret,
+    # bf16 -> mode 0 sans vue, donc le cas bf16 reste identique a l'amont.
+    ops = remplacer(ops,
+        "    head_dim = kv_cache.shape[-1] // 2\n"
+        "    key_cache, value_cache = kv_cache.transpose(1, 2).split(head_dim, dim=-1)",
+        "    head_dim = kv_cache.shape[-1] // 2\n"
+        "    key_cache, value_cache = kv_cache.transpose(1, 2).split(head_dim, dim=-1)\n"
+        "    # Same rule as the decode wrapper: uint8 holds the raw bytes of an\n"
+        "    # fp8 cache (the core allocates it that way) -> reinterpret it, and\n"
+        "    # derive the constexpr from the storage so the warmup compiles the\n"
+        "    # mode the first real launch will actually use.\n"
+        "    _warmup_kv_mode = 1 if kv_cache.dtype in (torch.uint8, torch.float8_e4m3fn) else 0\n"
+        "    if kv_cache.dtype == torch.uint8:\n"
+        "        key_cache = key_cache.view(torch.float8_e4m3fn)\n"
+        "        value_cache = value_cache.view(torch.float8_e4m3fn)",
+        "mode reel du warmup (v0.30)")
     ops = remplacer(ops,
         "            num_requests,\n            TOPK=selection_width,",
         "            num_requests,\n"
         "            _warmup_scale,\n"
         "            _warmup_scale,\n"
-        "            KV_QUANT_MODE=0,\n"
+        "            KV_QUANT_MODE=_warmup_kv_mode,\n"
         "            TOPK=selection_width,",
         "lancement du warmup decode (v0.30)")
 

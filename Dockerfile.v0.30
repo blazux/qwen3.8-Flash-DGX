@@ -12,6 +12,9 @@
 #   IMAGE=qwen38-flash-dgx:v0.30 scripts/serve.sh      # serve.sh reads the image label for the op names
 FROM vllm/vllm-openai:v0.30.0
 LABEL qwen38.base=v0.30
+# Patch 7 (fp8 KV on the QSA path) is in this build: src/patch_qsa_fp8_kv_v030.py below.
+# serve.sh accepts KV_DTYPE=fp8_e4m3 only for images carrying this label.
+LABEL qwen38.fp8kv=1
 ARG SP=/usr/local/lib/python3.12/dist-packages
 ARG PKG=${SP}/vllm/models/qwen4_exp/nvidia
 ARG PLE=${PKG}/ngram_embedding.py

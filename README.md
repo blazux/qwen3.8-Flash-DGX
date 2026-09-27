@@ -27,6 +27,7 @@ git clone https://github.com/blazux/qwen3.8-Flash-DGX.git && cd qwen3.8-Flash-DG
 ./flash serve       # the recommended recipe (profile "default"): hybrid, 500k context, deterministic
 ./flash wait        # first boot loads ~75 GiB of weights, ~3-4 min (patches 14-18); prints the KV pool when the API is up
 ./flash test        # health, coherence, prefix-cache hit, determinism, tok/s
+./flash stop        # stop the container but keep it for ./flash start
 ```
 
 Other recipes are one word away: `./flash profiles` lists them (`speed`, `context`, `context-1m`,

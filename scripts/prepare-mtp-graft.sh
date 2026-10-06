@@ -37,7 +37,7 @@ set -euo pipefail
 
 MODEL="${MODEL:-RadixArk/Qwen3.8-Flash-Next-NVFP4}"   # RadixArk only: its MTP drafter is bf16. NVIDIA's checkpoint (the default since 2026-09-14) already ships an fp8 drafter.
 case "$MODEL" in RadixArk/*) ;; *) echo "!! the MTP graft only applies to RadixArk/Qwen3.8-Flash-Next-NVFP4; $MODEL already has an fp8 MTP drafter (use MODE=hybrid)"; exit 1 ;; esac
-IMAGE="${IMAGE:-qwen38-flash-dgx:v0.30}"
+IMAGE="${IMAGE:-qwen38-flash-dgx:v0.31}"
 HF_CACHE="${HF_CACHE:-$HOME/.cache/huggingface}"
 
 REPO_DIR="$HF_CACHE/hub/models--${MODEL//\//--}"

@@ -2,3 +2,4 @@ docs/
 scripts/
 *.md
 .git/
+results/

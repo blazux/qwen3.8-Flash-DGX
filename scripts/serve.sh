@@ -59,7 +59,7 @@
 set -euo pipefail
 
 NAME="${NAME:-qwen38-flash}"
-IMAGE="${IMAGE:-qwen38-flash-dgx:v0.30}"
+IMAGE="${IMAGE:-qwen38-flash-dgx:v0.31}"
 MODEL="${MODEL:-nvidia/Qwen3.8-Flash-Next-NVFP4}"   # default since 2026-09-14; see README "Checkpoints"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-qwen3.8-flash-next}"
 HF_CACHE="${HF_CACHE:-$HOME/.cache/huggingface}"
@@ -178,12 +178,13 @@ if [ "$EFFORT_ALIAS" = 1 ]; then
   fi
 fi
 
-# The image must be a build of this repo's Dockerfile (LABEL qwen38.base=v0.30). An older preview or
-# v0.29 build under the same name has different op names and patches: refuse it rather than half-work.
+# The image must be a build of this repo's Dockerfile for a supported release.
+# Older preview/v0.29 builds have different op names and patches.
 BASE="$(docker image inspect -f '{{index .Config.Labels "qwen38.base"}}' "$IMAGE" 2>/dev/null || true)"
-if [ "$BASE" != "v0.30" ]; then
-  echo "!! $IMAGE is ${BASE:+a '$BASE'-base build, }${BASE:-missing or unlabeled}; this recipe needs the v0.30 image: docker build -t $IMAGE .  (or ./flash setup)"; exit 1
-fi
+case "$BASE" in
+  v0.31) ;;
+  *) echo "!! $IMAGE has unsupported base '${BASE:-missing or unlabeled}'; rebuild this recipe with ./flash setup"; exit 1 ;;
+esac
 
 # The PLE gather is a CPU op + a pageable host->device copy: it MUST run outside CUDA graphs.
 # On v0.30 the piecewise graphs are breakable captures and the gather ends a segment by itself
@@ -294,6 +295,11 @@ case "$COMPILE_CACHE" in
                 -v "${COMPILE_CACHE}-nv:/root/.nv") ;;
 esac
 
+ALLOCATOR_ENV=()
+if [ -n "${PYTORCH_ALLOC_CONF:-}" ]; then
+  ALLOCATOR_ENV=(-e "PYTORCH_ALLOC_CONF=$PYTORCH_ALLOC_CONF")
+fi
+
 docker rm -f "$NAME" >/dev/null 2>&1 || true
 # If docker run itself fails (port already bound, ...) do not leave a Created container behind.
 trap 'rc=$?; [ $rc -ne 0 ] && docker rm -f "$NAME" >/dev/null 2>&1; exit $rc' EXIT
@@ -302,6 +308,7 @@ docker run -d --name "$NAME" --restart unless-stopped \
   --gpus all --ipc=host --shm-size 16g -p "${PORT}:8000" \
   -v "$HF_CACHE:/hf" -e HF_HOME=/hf -e HF_HUB_OFFLINE=1 \
   "${PROM_ARGS[@]}" \
+  "${ALLOCATOR_ENV[@]}" \
   "${CACHE_MNT[@]}" "${TEMPLATE_MNT[@]}" "${LOG_MNT[@]}" \
   -e VLLM_PLE_MMAP=1 -e VLLM_PLE_MMAP_WORKERS="${WORKERS:-32}" -e VLLM_PLE_MMAP_PREWARM="$PREWARM" \
   -e VLLM_QSA_EXACT_TOPK="$EXACT_TOPK" "${DETENV[@]}" \

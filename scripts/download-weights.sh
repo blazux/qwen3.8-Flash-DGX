@@ -52,7 +52,7 @@
 set -euo pipefail
 
 MODEL="${MODEL:-nvidia/Qwen3.8-Flash-Next-NVFP4}"   # default since 2026-09-14; see README "Checkpoints"
-IMAGE="${IMAGE:-qwen38-flash-dgx:v0.30}"          # or the upstream image; only needs `hf`
+IMAGE="${IMAGE:-qwen38-flash-dgx:v0.31}"          # or the upstream image; only needs `hf`
 HF_CACHE="${HF_CACHE:-$HOME/.cache/huggingface}"
 EXCLUDE="${EXCLUDE:-}"
 MAX_WORKERS="${MAX_WORKERS:-8}"

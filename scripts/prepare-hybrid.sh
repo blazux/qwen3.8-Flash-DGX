@@ -17,7 +17,7 @@
 set -euo pipefail
 
 MODEL="${MODEL:-nvidia/Qwen3.8-Flash-Next-NVFP4}"   # default since 2026-09-14; works unchanged on RadixArk/Qwen3.8-Flash-Next-NVFP4
-IMAGE="${IMAGE:-qwen38-flash-dgx:v0.30}"
+IMAGE="${IMAGE:-qwen38-flash-dgx:v0.31}"
 HF_CACHE="${HF_CACHE:-$HOME/.cache/huggingface}"
 
 REPO_DIR="$HF_CACHE/hub/models--${MODEL//\//--}"

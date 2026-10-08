@@ -8,7 +8,7 @@ greedy decoding**, and up to **500k tokens of context**.
 The catch this repo solves: the NVFP4 checkpoint is **~125 GiB**, which does not fit
 next to a usable KV cache in the Spark's **128 GB unified pool**. 48 GiB of that is
 the n-gram embedding ("PLE") table — a pure lookup that a token only touches 16 rows
-of. This repo patches the official vLLM v0.30.0 image to **serve that table from NVMe via
+of. This repo patches the official vLLM v0.31.0 image to **serve that table from NVMe via
 `mmap`** instead of keeping it resident. Weights drop to **~75 GiB**, the rest of the
 pool goes to KV, and everything runs on stock GB10 kernels.
 
@@ -37,7 +37,7 @@ be overridden on the command line (`./flash serve default MTP=3 PORT=18301`). `.
 The same thing by hand, unchanged and still supported (everything `flash` does is these scripts):
 
 ```bash
-docker build -t qwen38-flash-dgx:v0.30 .      # official vLLM v0.30.0 image + the patches below
+docker build -t qwen38-flash-dgx:v0.31 .      # official vLLM v0.31.0 image + the patches below
 scripts/download-weights.sh                   # nvidia/Qwen3.8-Flash-Next-NVFP4, ~124 GiB via Xet, resumable (one-time)
 scripts/prepare-hybrid.sh                     # recommended: fp8 side layers, +20% decode, same quality (~10 min, one-time)
 MODE=hybrid YARN=1 CTX=500000 scripts/serve.sh   # the recommended recipe; 500k context, ~3-4 min to load
@@ -109,7 +109,7 @@ Not covered, both deliberate:
   parsed. That is the cost of deciding from the text alone;
   `test_unclosed_fence_suppresses_later_calls` asserts it so a change is deliberate.
 
-The regression patches extend vLLM's Qwen parser tests. To run them from a vLLM v0.30.0
+The regression patches extend vLLM's Qwen parser tests. To run them from a vLLM v0.31.0
 source checkout with its test dependencies installed (using absolute paths to
 this repository's patch files):
 
@@ -127,7 +127,25 @@ patch 13. The 9 that pass either way are the no-regression guards — a real cal
 still parses, a real call after a closed fence still parses, and patch 12's own
 inline-quoted-marker case is unchanged.
 
-## Update 2026-09-28 — vLLM v0.30 is the only base
+## Update 2026-10-06 — vLLM v0.31
+
+The recipe now uses the official v0.31.0 image. Build and run:
+
+```bash
+./flash setup
+./flash serve
+./flash wait
+./flash test
+```
+
+Keep your old image and launch configuration locally for rollback. Patches 7
+(QSA FP8 main KV) and 16 (expert-name indexing) are now native upstream and are
+not reapplied. The remaining model/GB10 patches are retained, with updated
+loader and parser anchors. See [the GB10 evaluation notes](docs/VLLM-031.md)
+for measurements, startup caveats, rollback and test coverage. This is not a
+claim that all profiles or the agentic quality tournament have been validated.
+
+## Update 2026-09-28 — vLLM v0.30 became the stable base
 
 - **One base image, one `Dockerfile`.** It builds the recipe on the vLLM v0.30.0 release
   (`qwen38-flash-dgx:v0.30`) and every profile uses it. v0.30 has run our own box since 2026-09-25:
@@ -834,7 +852,7 @@ Details: [results-radixark-vllm.md](https://github.com/jschmied/qwen38-flash-nex
 ```
 flash                             one-command front-end: doctor / setup / serve <profile> / wait / test / status …
 profiles/*.env                    named recipes for it (default, speed, context, context-1m, shared, published, native)
-Dockerfile                        official vLLM v0.30.0 image + the patches below (qwen38-flash-dgx:v0.30).
+Dockerfile                        official vLLM v0.31.0 image + the patches below (qwen38-flash-dgx:v0.31).
                                      Gaps in the numbering are upstream now: 3, 9, 11 (docs/HISTORY.md)
 src/vllm_ple_mmap.py              1. mmap PLE table (opaque op, breaks the CUDA-graph capture)  VLLM_PLE_MMAP=1
 src/patch_mamba_block_size.py     4. prefix-caching block_size fix
@@ -880,9 +898,9 @@ docs/HISTORY.md                   the earlier updates and the preview / v0.29 ba
 Run the unit tests (no GPU):
 
 ```bash
-docker run --rm -v "$PWD/src:/t" -w /t --entrypoint python3 qwen38-flash-dgx:v0.30 test_ple_mmap_cpu.py
-docker run --rm -v "$PWD/src:/t" -w /t --entrypoint python3 qwen38-flash-dgx:v0.30 test_qsa_exact_topk_cpu.py
-docker run --rm -v "$PWD/src:/t" -w /t --entrypoint python3 qwen38-flash-dgx:v0.30 test_moe_name_index_cpu.py
+docker run --rm -v "$PWD/src:/t" -w /t --entrypoint python3 qwen38-flash-dgx:v0.31 test_ple_mmap_cpu.py
+docker run --rm -v "$PWD/src:/t" -w /t --entrypoint python3 qwen38-flash-dgx:v0.31 test_qsa_exact_topk_cpu.py
+# test_moe_name_index_cpu.py exercises the retired local patch, not v0.31's native index.
 ```
 
 ## Limitations & notes
@@ -923,7 +941,7 @@ docker run --rm -v "$PWD/src:/t" -w /t --entrypoint python3 qwen38-flash-dgx:v0.
 - NVFP4 MTP draft experts (the `hybrid-mtp` graft donor): **[Inferact/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/Inferact/Qwen3.8-Flash-Next-NVFP4)**; the graft recipe follows
   [thavoc's graft write-up](https://gist.github.com/thavoc/d7083457f6f2d981f879670c34df34ab)
   and [Peuqui/mtp-quant-transplant](https://github.com/Peuqui/mtp-quant-transplant).
-- Serving engine and base image: **vLLM** (`vllm/vllm-openai:v0.30.0`; the model's support started as
+- Serving engine and base image: **vLLM** (`vllm/vllm-openai:v0.31.0`; the model's support started as
   the `release/qwen38next` recipe / PR #53896); the Mamba state-copy race fix is
   [vllm#50729](https://github.com/vllm-project/vllm/pull/50729) by **@AndreasKaratzas**.
 - GB10 FLA fixes, the faster PLE gather, the state-copy guard and the fp8 side-layer

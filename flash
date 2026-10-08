@@ -71,12 +71,11 @@ load_profile() {
   export NAME="${NAME:-qwen38-flash}" PORT="${PORT:-18300}" MODE="${MODE:-nvfp4}"
   export MODEL="${MODEL:-$MODEL_DEFAULT}" HF_CACHE="${HF_CACHE:-$HOME/.cache/huggingface}"
   export GPU_MEM="${GPU_MEM:-0.80}" KV_DTYPE="${KV_DTYPE:-auto}"
-  export IMAGE="${IMAGE:-qwen38-flash-dgx:v0.30}"
+  export IMAGE="${IMAGE:-qwen38-flash-dgx:v0.31}"
 }
 
-# The image carries LABEL qwen38.base=v0.30. Anything else (an older preview or v0.29 build under
-# the same name, or an unlabeled one) is rebuilt by setup and refused by serve.
-BASE_EXPECTED=v0.30
+# The image must match the current recipe. Retain old images locally for rollback.
+BASE_EXPECTED=v0.31
 
 # Same snapshot resolution as scripts/serve.sh (refs/main first).
 snapshot_dir() {

@@ -12,16 +12,16 @@
          value = self.terminals.get(name)
 --- a/vllm/parser/engine/streaming_parser_engine.py
 +++ b/vllm/parser/engine/streaming_parser_engine.py
-@@ -212,6 +212,9 @@
+@@ -210,6 +210,9 @@
+         self._scanner.reset()
+         self._lexer.reset()
          self._message_header_buffer = ""
-         self._message_header_token_count = 0
-         self._in_skipped_tool_span = False
 +        self._pending_tool_start: tuple[str, str, int] | None = None
 +        self._tool_preamble_buffer = ""
 +        self._tool_preamble_token_count = 0
+         self._message_header_token_count = 0
+         self._in_skipped_tool_span = False
          self._reset_args_state()
- 
-     def feed(
 @@ -289,6 +292,8 @@
  
          events.extend(self._process_lex_tokens(self._lexer.flush()))

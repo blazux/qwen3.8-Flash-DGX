@@ -13,13 +13,23 @@ import sys
 RE = f"{sys.argv[1]}/vllm/model_executor/layers/fused_moe/routed_experts.py"
 s = open(RE).read()
 
-old = ("            shard_dim=shard_dim,\n"
-       "        )\n"
-       "        expert_data.copy_(loaded_weight)\n")
-assert s.count(old) == 2, f"_load_w13/_load_w2 copy_ sites: expected 2, found {s.count(old)}"
-s = s.replace(old, ("            shard_dim=shard_dim,\n"
-                    "        )\n"
-                    "        expert_data.copy_(_qwen38_h2d_src(expert_data, loaded_weight))\n"))
+# v0.31 adds a bounded copy for strided TP slices in _load_w2. Preserve that
+# branch and hook only each method's final ordinary copy, as on v0.30.
+lines = s.splitlines(keepends=True)
+tree = ast.parse(s)
+sites = []
+for node in ast.walk(tree):
+    if isinstance(node, ast.FunctionDef) and node.name in ("_load_w13", "_load_w2"):
+        final = node.body[-1]
+        line = lines[final.lineno - 1]
+        assert line.strip() == "expert_data.copy_(loaded_weight)", f"{node.name}: final copy moved"
+        sites.append(final.lineno - 1)
+assert len(sites) == 2, f"expected _load_w13 and _load_w2, found {len(sites)}"
+for site in sites:
+    lines[site] = lines[site].replace(
+        "expert_data.copy_(loaded_weight)",
+        "expert_data.copy_(_qwen38_h2d_src(expert_data, loaded_weight))")
+s = "".join(lines)
 
 s += '''
 

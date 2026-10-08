@@ -1,14 +1,14 @@
-# Qwen3.8-Flash-Next on a DGX Spark — the official vLLM v0.30.0 image plus these patches:
+# Qwen3.8-Flash-Next on a DGX Spark — the official vLLM v0.31.0 image plus these patches:
 #   1 PLE mmap, 2 GB10 FLA fixes, 4 prefix-caching block_size fix, 5 exact top-k, 6 hybrid mode,
-#   7 fp8 KV cache, 8 deterministic top-k kernel, 10 reduced draft vocabulary, 12 Qwen tool preamble fix,
+#   8 deterministic top-k kernel, 10 reduced draft vocabulary, 12 Qwen tool preamble fix,
 #   13 quoted Qwen tool markers stay text, 14 MoE weight-load clone (#33), 15-18 the rest of weight
-#   loading (pread, expert-name index, chunked embedding copy, MTP name prefilter).
-# The gaps in the numbering are fixes that are now upstream: 3 (vllm#50729), 9 (vllm#52775) and
-# 11 (vllm#55513). The older preview and v0.29 bases are at the git tag multi-base-final.
+#   loading (pread, chunked embedding copy, MTP name prefilter).
+# Upstream now: 3 (vllm#50729), 7 (vllm#55557), 9 (vllm#52775),
+# 11 (vllm#55513), 16 (vllm#58720). Older bases remain in git history.
 #
-#   docker build -t qwen38-flash-dgx:v0.30 .      # ./flash setup does this for you
-FROM vllm/vllm-openai:v0.30.0
-LABEL qwen38.base=v0.30
+#   docker build -t qwen38-flash-dgx:v0.31 .
+FROM vllm/vllm-openai:v0.31.0
+LABEL qwen38.base=v0.31
 ARG SP=/usr/local/lib/python3.12/dist-packages
 ARG PKG=${SP}/vllm/models/qwen4_exp/nvidia
 ARG PLE=${PKG}/ngram_embedding.py
@@ -27,7 +27,7 @@ RUN sed -i 's|DEFAULT = 102400|DEFAULT = 101376  # spark-fla-shmem: GB10 99KiB, 
  && sed -i 's|for num_warps in \[2, 4\]|for num_warps in [2]  # spark-fla-warps: fla#953 Blackwell tl.dot race|' ${FLA_CDH} \
  && grep -q "spark-fla-warps" ${FLA_CDH} && echo "fla num_warps pinned"
 
-# --- 4. Prefix caching: block_size fix (still needed on v0.30: core.py takes the min group block) ---
+# --- 4. Prefix caching: block_size fix (core.py takes the min group block) ---
 COPY src/patch_mamba_block_size.py /tmp/patch_mamba_block_size.py
 RUN python3 /tmp/patch_mamba_block_size.py ${SP} && rm /tmp/patch_mamba_block_size.py
 
@@ -49,12 +49,10 @@ RUN cp ${MO} ${MO}.orig \
  && python3 -c "import ast; ast.parse(open('${QSA}').read()); print('qsa.py hooked OK')"
 
 # --- 7. fp8_e4m3 main KV cache on the QSA path (--kv-cache-dtype fp8_e4m3; KV_DTYPE=fp8_e4m3) ---
-# After @Nanetnounou's original (issue #6): dequantize on the read side of the split-K kernel with
-# vLLM's _cast_kv_tile and the layer's real scales, widen the guards.
-# The indexer caches are left to v0.30 (raw keys bf16, compressed keys with their own dtype knob).
-# Inert with --kv-cache-dtype auto (the Triton branch is compiled out).
-COPY src/patch_qsa_fp8_kv.py /tmp/patch_qsa_fp8_kv.py
-RUN python3 /tmp/patch_qsa_fp8_kv.py ${SP} && rm /tmp/patch_qsa_fp8_kv.py
+# The earlier local implementation followed @Nanetnounou's original (issue #6).
+# Use upstream support now, with assertions against accidental base drift.
+# Native since v0.31 (vllm#55557); do not apply the older local patch.
+RUN grep -q 'IS_FP8=is_fp8' ${PKG}/ops/qsa.py && grep -q '"fp8_e4m3"' ${QSA}
 
 # --- 8. Deterministic persistent_topk kernel (@jschmied, vllm#55122), built with the image's nvcc ---
 # v0.30 changed the stock kernel (vllm#54110 low-smem fallback, vllm#56346 sampled filtering): whether GB10
@@ -98,12 +96,13 @@ RUN python3 /tmp/patch_moe_load_clone.py ${SP} && rm /tmp/patch_moe_load_clone.p
 
 # --- 15-18. The rest of weight loading (docs/HOW-IT-WORKS.md, "The rest of weight loading") ---
 # 15: pread tensors <= 64 MiB into ordinary memory, not mmap views; never the PLE table (needs 14).
-# 16: indexed expert-name matching instead of substring-testing 1,536 entries per tensor.
+# 16: indexed expert-name matching is native upstream since v0.31.
 # 17: embed_tokens / lm_head copied to the GPU in 64 MiB pieces via ordinary memory.
 # 18: the MTP drafter skips non-MTP tensors by name before they are read.
-COPY src/patch_load_pread.py src/patch_moe_name_index.py src/patch_embed_chunked_copy.py \
+COPY src/patch_load_pread.py src/patch_embed_chunked_copy.py \
      src/patch_mtp_name_prefilter.py /tmp/
-RUN python3 /tmp/patch_load_pread.py ${SP} && python3 /tmp/patch_moe_name_index.py ${SP} \
+RUN python3 /tmp/patch_load_pread.py ${SP} \
+ && grep -q 'mapping_by_expert = _index_expert_mapping' ${SP}/vllm/model_executor/layers/fused_moe/routed_experts.py \
  && python3 /tmp/patch_embed_chunked_copy.py ${SP} && python3 /tmp/patch_mtp_name_prefilter.py ${SP} \
- && rm /tmp/patch_load_pread.py /tmp/patch_moe_name_index.py /tmp/patch_embed_chunked_copy.py \
+ && rm /tmp/patch_load_pread.py /tmp/patch_embed_chunked_copy.py \
        /tmp/patch_mtp_name_prefilter.py

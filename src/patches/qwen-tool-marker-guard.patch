@@ -29,14 +29,14 @@
  
          self._reasoning_markup_terminals: frozenset[str] = (
              self._compute_reasoning_markup_terminals()
-@@ -215,6 +223,7 @@
+@@ -212,6 +220,7 @@
+         self._message_header_buffer = ""
          self._pending_tool_start: tuple[str, str, int] | None = None
          self._tool_preamble_buffer = ""
-         self._tool_preamble_token_count = 0
 +        self._reset_marker_guard()
-         self._reset_args_state()
- 
-     def feed(
+         self._tool_preamble_token_count = 0
+         self._message_header_token_count = 0
+         self._in_skipped_tool_span = False
 @@ -437,6 +446,15 @@
              return self._emit_for_state(value, token_count)
  

@@ -127,9 +127,10 @@ patch 13. The 9 that pass either way are the no-regression guards — a real cal
 still parses, a real call after a closed fence still parses, and patch 12's own
 inline-quoted-marker case is unchanged.
 
-## Update 2026-10-06 — vLLM v0.31
+## Update 2026-10-08 — vLLM v0.31 is the current base
 
-The recipe now uses the official v0.31.0 image. Build and run:
+The recipe uses the official v0.31.0 image. Existing prepared checkpoints can
+be reused without conversion. Build and run:
 
 ```bash
 ./flash setup
@@ -138,12 +139,11 @@ The recipe now uses the official v0.31.0 image. Build and run:
 ./flash test
 ```
 
-Keep your old image and launch configuration locally for rollback. Patches 7
-(QSA FP8 main KV) and 16 (expert-name indexing) are now native upstream and are
-not reapplied. The remaining model/GB10 patches are retained, with updated
-loader and parser anchors. See [the GB10 evaluation notes](docs/VLLM-031.md)
-for measurements, startup caveats, rollback and test coverage. This is not a
-claim that all profiles or the agentic quality tournament have been validated.
+Tested on GX10 with the NVIDIA hybrid checkpoint, MTP=2 and FP8 KV caching:
+the agentic tournament, prefix caching, sequential greedy determinism and
+long-context retrieval at 499,000 input tokens. See the
+[v0.31 validation results](docs/VLLM-031.md#gx10-validation-2026-10-07-to-2026-10-08)
+for quality and performance measurements.
 
 ## Update 2026-09-28 — vLLM v0.30 became the stable base
 

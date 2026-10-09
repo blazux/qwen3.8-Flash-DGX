@@ -1,0 +1,7 @@
+# Optional diagnostic derivative; use the already-built recipe image as BASE.
+# No model download, CUDA build or changes to the normal Dockerfile.
+ARG BASE=qwen38-flash-dgx:v0.31
+FROM ${BASE}
+COPY tools/patch_memory_profile_logging.py /tmp/patch_memory_profile_logging.py
+RUN python3 /tmp/patch_memory_profile_logging.py /usr/local/lib/python3.12/dist-packages \
+ && rm /tmp/patch_memory_profile_logging.py

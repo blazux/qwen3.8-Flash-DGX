@@ -4,6 +4,113 @@ The current recipe uses the official v0.31.0 image, with the existing model/GB10
 patches. The model layouts and profiles are unchanged; no checkpoint conversion
 is required when upgrading from v0.30.
 
+## GX10 validation (2026-10-07 to 2026-10-08)
+
+The maintainer compared v0.30 and v0.31 on the same ASUS GX10, using the NVIDIA
+checkpoint revision `fc694b54fb0174e0913e6adf86691ef85a4ead47` in hybrid mode.
+Both versions used MTP=2, deterministic top-k, the reduced draft vocabulary,
+prefix caching, YaRN with a 500,000-token context, eight sequence slots and
+`fp8_e4m3` KV caching with an explicit 8 GiB pool. No PyTorch allocator override
+was used. Other serving profiles and checkpoints were outside this comparison.
+
+### Agentic quality
+
+Each version completed three passes of a 55-scenario agentic tournament, with
+four concurrent scenarios, temperature 0.2 and a 32,000-token generation cap.
+
+| Result | v0.30 | v0.31 |
+| --- | ---: | ---: |
+| Mean score | 87.53% | 90.84% |
+| Scores per pass | 89.0%, 87.3%, 86.3% | 92.7%, 90.8%, 89.0% |
+| Generation-cap hits | 19 / 165 | 15 / 165 |
+| Request errors | 0 | 0 |
+
+The observed difference was +3.31 percentage points. The paired scenario
+bootstrap's 95% interval included zero (approximately 0 to +6.97 points), and
+the run-level permutation test gave p=0.20. The results show no quality drop
+in this sample; they do not establish a statistically significant improvement.
+Long reasoning sometimes reached the generation cap on both releases.
+
+### Serving and long context
+
+- Both versions retrieved the planted information in two synthetic prompts
+  with **499,000 input tokens**, counted with the server's chat tokenizer.
+- Prefix-cache hits, sequential greedy determinism and the Anthropic-compatible
+  `/v1/messages` endpoint with high reasoning effort passed.
+- Single-stream decode was close: approximately 37–39 output tok/s on v0.30
+  versus 37–38 on v0.31. Four-client aggregate throughput was 107.7 versus
+  104.4 output tok/s, about 3% lower on v0.31 in that measurement.
+- A v0.30/v0.31/v0.30 prefill recheck at approximately 8k, 32k and 128k tokens
+  did not reproduce the initially suspected large prefill slowdown.
+- All 173 Qwen parser cases in the validation suite, the PLE mmap and Exact-Top-k
+  CPU checks, and four upstream native FP8-QSA GPU correctness cases passed.
+- Repeated v0.31 starts succeeded with the standard allocator settings.
+
+### Automatic KV sizing investigation (#51)
+
+The FP8 comparison above used `KV_CACHE_MEM=8589934592`, which skips automatic
+memory-budget profiling. It validates serving with that fixed pool; it does
+not measure the automatically selected KV capacity. The lower automatic
+capacity reported in [issue #51](https://github.com/blazux/qwen3.8-Flash-DGX/issues/51)
+remains under investigation.
+
+On an integrated GPU, vLLM's `MemorySnapshot` uses Linux `MemAvailable` for its
+free-memory reading. Its `total_consumed` is the difference between startup
+and post-profile available memory. The startup label "weights + non-torch"
+therefore includes changes in shared host memory; it does not identify which
+component allocated the difference. Both v0.30 and v0.31 use this accounting.
+See vLLM's [`MemorySnapshot` and `memory_profiling` implementation](https://github.com/vllm-project/vllm/blob/v0.31.0/vllm/utils/mem_utils.py).
+The native QSA FP8 kernel dequantizes tiles in the kernel and its Python split-K
+scratch buffers are PyTorch allocations. A persistent non-torch dequantization
+workspace has not been established as the cause; see the
+[native QSA implementation](https://github.com/vllm-project/vllm/blob/v0.31.0/vllm/models/qwen4_exp/nvidia/ops/qsa.py).
+
+The CUDA-graph estimate is a separate deduction from the automatic budget.
+Turning it off can increase the KV pool, but also removes its memory allowance;
+it does not demonstrate that the underlying consumption delta has disappeared.
+`KV_CACHE_MEM` likewise sets a manual pool rather than reclaiming memory.
+
+#### Optional diagnostic images
+
+Build a logging-only derivative of each **existing, locally built** recipe image:
+
+```bash
+docker build -f tools/Dockerfile.memory-diagnostics \
+  --build-arg BASE=qwen38-flash-dgx:v0.30 \
+  -t qwen38-flash-dgx:v0.30-memory-diag .
+docker build -f tools/Dockerfile.memory-diagnostics \
+  --build-arg BASE=qwen38-flash-dgx:v0.31 \
+  -t qwen38-flash-dgx:v0.31-memory-diag .
+```
+
+These derivatives add startup logging without changing allocation or KV-budget
+logic. They do not rebuild vLLM or download model weights. They use the same
+diagnostic hook on both releases and fail the build if its source anchors differ.
+
+On a test host, repeat the original launch command with only `IMAGE` changed to
+the corresponding diagnostic tag. Leave `KV_CACHE_MEM` unset to exercise
+automatic sizing. Keep the checkpoint, launch arguments, allocator settings,
+prewarm setting, graph estimator and other services consistent across boots.
+Collect the startup logs before sending inference requests:
+
+```bash
+# Substitute the container name used in the original launch command.
+docker logs qwen38-flash > startup-memory.log 2>&1
+grep 'qwen38-memory' startup-memory.log > startup-memory-records.log
+```
+
+Each `qwen38-memory` record contains JSON with raw CUDA free memory, the free
+memory used by vLLM, PyTorch allocated/reserved/peak bytes, Linux memory fields,
+the current process's RSS/PSS, call sites and package versions. The final
+`profile_result` record includes the inputs to the non-KV budget calculation.
+These diagnostic records contain no prompts or model outputs.
+
+For #51, provide records from both versions, their image IDs and driver version,
+and the startup summary lines for consumed memory, activation peak, graph
+estimate/actual usage and available KV. These measurements distinguish changes
+in host memory, persistent PyTorch allocations and transient profiling overhead
+before selecting an allocator or kernel change.
+
 ## Build and run
 
 ```bash
@@ -52,10 +159,11 @@ existing name. This returns to the original container's command and environment.
   is unchanged. The two upstream Qwen parser test modules, with this repo's
   test patches, passed all 122 cases on the candidate image.
 
-These are compatibility changes, not evidence that every profile or optional
-FP8-KV path has been validated on v0.31.
+## Contributor measurements (2026-10-06)
 
-## Measured results (2026-10-06)
+These Lenovo GB10 measurements used BF16 KV caching and a different driver.
+They document the initial upgrade evaluation; the GX10 comparison above uses
+the FP8 configuration described there.
 
 Host: Lenovo GB10, ARM64, 121.6 GiB unified host memory, NVIDIA driver 595.84,
 CUDA driver 13.2, NVMe storage. Same NVIDIA checkpoint revision
@@ -109,8 +217,8 @@ The serving smoke test passed on both versions: coherent response,
 first-token logprobs. Its single 400-token decode sample improved from 34.2 to
 37.1 end-to-end tok/s. The first v0.31 smoke prefill was slower (11.42 versus
 3.76 seconds); repeated benchmark prefills above did not reproduce that result.
-No agentic quality tournament, full 500k-context correctness test, alternate
-checkpoint/profile, or native FP8-KV GPU correctness test was run.
+The subsequent GX10 validation above adds the agentic tournament,
+499k-token retrieval probes and native FP8-QSA GPU correctness checks.
 
 CPU checks on the final image also passed: synthetic PLE mmap gathers, the
 placeholder/zero/out-of-range/prewarm paths, and Exact-Top-k against `torch.topk`.

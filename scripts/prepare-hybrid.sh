@@ -115,8 +115,11 @@ set -euo pipefail
 rm -rf '$DST_IN'
 # cp -a keeps the relative symlinks (../../blobs/<sha>) as symlinks: instant, no copy.
 cp -a '$SRC_IN' '$DST_IN'
-# The converter rewrites the index: make it a real file first.
-cp --remove-destination \"\$(readlink -f '$DST_IN/model.safetensors.index.json')\" '$DST_IN/model.safetensors.index.json'
+# The converter rewrites the index: copy from the original snapshot, whether its
+# index is a symlink or a regular file. Resolving a regular destination copies it
+# onto itself; writing through a copied symlink would modify the shared blob.
+rm -f '$DST_IN/model.safetensors.index.json'
+cp '$SRC_IN/model.safetensors.index.json' '$DST_IN/model.safetensors.index.json'
 python3 /tools/fp8_convert.py '$DST_IN' | tee '$DST_IN/fp8_convert.log'
 # The converter moves each rewritten shard's symlink to <shard>.bf16.bak (a symlink,
 # costs nothing) and writes the fp8 shard as a real file.

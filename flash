@@ -20,6 +20,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROFILES_DIR="$HERE/profiles"
+source "$HERE/scripts/image-capabilities.sh"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/qwen38-flash"
 MODEL_DEFAULT="nvidia/Qwen3.8-Flash-Next-NVFP4"   # default since 2026-09-14 (README: Checkpoints); RadixArk/Qwen3.8-Flash-Next-NVFP4 still supported
 DRY="${DRY:-0}"
@@ -211,6 +212,9 @@ cmd_doctor() {
   elif have_image; then
     local b; b="$(image_base)"
     if [ "$b" != "$BASE_EXPECTED" ]; then warn "$IMAGE is an old '${b:-unlabeled}' build, this recipe needs the $BASE_EXPECTED base — rebuild: ./flash setup $profile"; else ok "$IMAGE present (base $b)"; fi
+    if [ -n "$DRAFT_MODEL" ] && ! image_has_dflash; then
+      fail "$IMAGE lacks the DFlash capability label (patch 23) — rebuild: ./flash setup $profile"
+    fi
   else info "$IMAGE not built yet — ./flash setup $profile will (a few minutes, plus the pull)"; fi
 
   step "weights ($MODEL in $HF_CACHE)"
@@ -258,7 +262,8 @@ cmd_setup() {
   echo "setup — profile '$profile' (image $IMAGE, mode $MODE). Every step is skipped when already done."
 
   step "1/4 image $IMAGE"
-  if have_image && [ "$(image_base)" = "$BASE_EXPECTED" ]; then ok "already built (base $BASE_EXPECTED)"; else
+  if have_image && [ "$(image_base)" = "$BASE_EXPECTED" ] \
+     && { [ -z "$DRAFT_MODEL" ] || image_has_dflash; }; then ok "already built (base $BASE_EXPECTED, required capabilities present)"; else
     [ -f "$HERE/Dockerfile" ] || die "Dockerfile not found in $HERE"
     run docker build -t "$IMAGE" "$HERE"; ok "built"; fi
 
@@ -294,8 +299,12 @@ cmd_serve() {
   printf '%s  MODE=%s IMAGE=%s NAME=%s PORT=%s CTX=%s YARN=%s MTP=%s SEQS=%s GPU_MEM=%s KV_DTYPE=%s%s\n' "$c_dim" "$MODE" "$IMAGE" "$NAME" "$PORT" "${CTX:-262144}" "${YARN:-0}" "${MTP:-2}" "${SEQS:-8}" "$GPU_MEM" "$KV_DTYPE" "$c_off"
   [ -n "${DRAFT_MODEL:-}" ] && printf '%s  DRAFT_MODEL=%s DRAFT_TOKENS=%s%s\n' "$c_dim" "$DRAFT_MODEL" "${DRAFT_TOKENS:-4}" "$c_off" || true
   [ -n "${CPUSET:-}${MAMBA_SSM_DTYPE:-}" ] && printf '%s  CPUSET=%s MAMBA_SSM_DTYPE=%s%s\n' "$c_dim" "${CPUSET:--}" "${MAMBA_SSM_DTYPE:--}" "$c_off" || true
+  [ -n "${DOCKER_EXTRA:-}" ] && printf '%s  DOCKER_EXTRA=%s%s\n' "$c_dim" "$DOCKER_EXTRA" "$c_off" || true
   [ -n "${EXTRA:-}" ] && printf '%s  EXTRA=%s%s\n' "$c_dim" "$EXTRA" "$c_off" || true
   have_image || die "$IMAGE is not built — run: ./flash setup $profile"
+  if [ -n "$DRAFT_MODEL" ] && ! image_has_dflash; then
+    die "$IMAGE lacks DFlash support (patch 23), even if its base is $BASE_EXPECTED — rebuild: ./flash setup $profile"
+  fi
   have_weights || die "weights not downloaded — run: ./flash setup $profile"
   case "$MODE" in hybrid|hybrid-mtp) have_hybrid || die "hybrid checkpoint not prepared — run: ./flash setup $profile"
     local stale; stale="$(hybrid_stale)"; [ -z "$stale" ] || die "hybrid layout is missing $stale (prepared from an incomplete download, issue #17) — run scripts/prepare-hybrid.sh again, it repairs it" ;; esac
@@ -304,7 +313,7 @@ cmd_serve() {
   local b; b="$(image_base)"
   [ "$b" != "$BASE_EXPECTED" ] && die "$IMAGE is an old '${b:-unlabeled}' build, this recipe needs the $BASE_EXPECTED base — run: ./flash setup $profile"
   if [ "$(container_state)" = running ]; then info "$NAME is running and will be replaced"; fi
-  if [ "$DRY" = 1 ]; then info "dry run: would exec scripts/serve.sh with the environment above"; env | grep -E '^(MODE|IMAGE|NAME|SERVED_MODEL_NAME|PORT|CTX|YARN|MTP|DRAFT_MODEL|DRAFT_TOKENS|SEQS|CPUSET|MAMBA_SSM_DTYPE|GPU_MEM|KV_DTYPE|PREFIX_CACHE|DET_TOPK|EXACT_TOPK|DRAFT_VOCAB|MADVISE|FAST_ROWS|EFFORT_ALIAS|PREWARM|COMPILE_CACHE|EXTRA|LOG_REQUESTS|WORKERS)=' | sort | sed 's/^/    /'; return 0; fi
+  if [ "$DRY" = 1 ]; then info "dry run: would exec scripts/serve.sh with the environment above"; env | grep -E '^(MODE|IMAGE|NAME|SERVED_MODEL_NAME|PORT|CTX|YARN|MTP|DRAFT_MODEL|DRAFT_TOKENS|SEQS|CPUSET|MAMBA_SSM_DTYPE|GPU_MEM|KV_DTYPE|PREFIX_CACHE|DET_TOPK|EXACT_TOPK|DRAFT_VOCAB|MADVISE|FAST_ROWS|EFFORT_ALIAS|PREWARM|COMPILE_CACHE|EXTRA|DOCKER_EXTRA|LOG_REQUESTS|WORKERS)=' | sort | sed 's/^/    /'; return 0; fi
   remember_profile "$profile"
   exec "$HERE/scripts/serve.sh"
 }

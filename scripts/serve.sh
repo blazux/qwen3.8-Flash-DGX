@@ -63,6 +63,8 @@
 #   PREWARM=0         1 = stream the 48 GiB table once at boot to warm the page cache
 #   WORKERS=32        threads for the mmap gather
 #   EXTRA=            extra vllm flags passed verbatim
+#   DOCKER_EXTRA=     extra docker run flags, whitespace-separated (no shell quoting/expansion;
+#                     paths/values must not contain whitespace); e.g. -v /srv/certs:/certs:ro
 #   COMPILE_CACHE=    where to keep vLLM's and FlashInfer's caches, Triton's kernels and the CUDA
 #                     driver's JIT cache across boots. Unset (default) = inside the container,
 #                     which this script recreates every time, so they are rebuilt on every boot
@@ -102,6 +104,17 @@ KV_CACHE_MEM="${KV_CACHE_MEM:-}"
 PROM_MULTIPROC="${PROM_MULTIPROC:-0}"
 PREWARM="${PREWARM:-0}"
 EXTRA="${EXTRA:-}"
+DOCKER_EXTRA="${DOCKER_EXTRA:-}"
+# Split flags without eval, shell execution or pathname expansion.
+DOCKER_ARGS=()
+read -r -a DOCKER_ARGS <<< "${DOCKER_EXTRA//$'\n'/ }"
+
+SERVE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$SERVE_ROOT/scripts/image-capabilities.sh"
+if [ -n "$DRAFT_MODEL" ] && ! image_has_dflash; then
+  echo "!! $IMAGE lacks DFlash support (patch 23) — run ./flash setup dflash or rebuild this image from the current Dockerfile."
+  exit 1
+fi
 COMPILE_CACHE="${COMPILE_CACHE:-}"
 
 # Resolve the local snapshot directory and map it to the in-container mount.
@@ -160,7 +173,6 @@ SNAP_IN="/hf/hub/models--${MODEL//\//--}/snapshots/$SNAP_NAME"
 # manual `docker run` is root-owned, and this must not silently degrade to a 400 there). It is
 # bind-mounted read-only at a fixed path, so the location does not matter to the container or to
 # its --restart policy.
-SERVE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TEMPLATE_ARGS=()
 TEMPLATE_MNT=()
 EFFORT_ALIAS_STATE=off
@@ -233,7 +245,7 @@ if [ "$YARN" != 0 ]; then OVR_ARGS=(--hf-overrides "$YARN_OVR"); ALLOW_LONG=1; f
 # (src/patch_dflash_qwen4exp.py: allowlist + target aux-hidden-state seam + QSA ring,
 # per vllm-project/vllm#56088, recipe PixelML/deepspec-qwen38-flash-next/serving).
 # dflash is V2-runner-only, so the V2 runner is pinned here; rebuild the image
-# (docker build) after pulling so patch 23 is present.
+# (./flash setup dflash or docker build) after pulling so patch 23 is present.
 # MEASURED 2026-10-28 (GX10, matched serving settings, context 500k, DRAFT_TOKENS=4):
 # 57.0 vs 45.2 tok/s with MTP=2 (+26% single-request throughput, including latency).
 # No quality degradation observed in validation; DFlash uses more GPU memory.
@@ -391,6 +403,7 @@ docker run -d --name "$NAME" --restart unless-stopped \
   -e VLLM_QSA_EXACT_TOPK="$EXACT_TOPK" "${DETENV[@]}" \
   -e VLLM_USE_FLASHINFER_SAMPLER=1 -e VLLM_ALLOW_LONG_MAX_MODEL_LEN="$ALLOW_LONG" \
   "${HYBRID_ENV[@]}" "${DRAFT_ENV[@]}" \
+  "${DOCKER_ARGS[@]}" \
   "$IMAGE" \
   "$SNAP_IN" --served-model-name "$SERVED_MODEL_NAME" \
     --host 0.0.0.0 --port 8000 --load-format safetensors \

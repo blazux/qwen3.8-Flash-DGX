@@ -340,7 +340,7 @@ variables, checks what is already done, and tells you what is missing.
 | command | what it does |
 | --- | --- |
 | `./flash doctor [profile]` | checks arm64/GB10, the 128 GB pool and how much of it is free right now (vLLM needs `GPU_MEM` × total *free* to boot), docker + nvidia runtime, other running containers, the port, the image and its base label, the checkpoint, the prepared layouts, disk space for what is still to download, and the profile itself (YaRN vs context, context vs KV dtype) |
-| `./flash setup [profile]` | build the image if missing or using an older base, download the weights, prepare the hybrid layout and the MTP graft; completed steps are skipped. Source-only updates on the same base require an explicit `docker build`. |
+| `./flash setup [profile]` | build the image if missing, using an older base, or missing DFlash support required by the selected profile; download the weights, prepare the hybrid layout and the MTP graft; completed steps are skipped. Other source-only updates on the same base still require an explicit `docker build`. |
 | `./flash serve [profile] [KEY=VALUE…]` | loads the profile, applies your overrides, refuses early if something is missing, then `exec`s `scripts/serve.sh` |
 | `./flash wait` | polls the container and the API, shows the loading stage, prints the KV pool when up |
 | `./flash test` | `scripts/smoke-test.sh` against the running server |
@@ -367,8 +367,11 @@ to `qwen38-flash` and `18300`, like `serve.sh`.
 
 ### DFlash profile
 
-`./flash setup dflash` prepares the draft model; after updating an existing checkout,
-rebuild the image with `docker build -t qwen38-flash-dgx:v0.32 .` to include patch 23.
+`./flash setup dflash` prepares the draft model and rebuilds an existing image
+when it lacks the DFlash capability label, even if it already uses vLLM v0.32.
+Images built before this check was added are rebuilt once. `doctor dflash` and
+`serve dflash` report missing support before replacing a container. A manual
+`docker build -t qwen38-flash-dgx:v0.32 .` also includes patch 23.
 Start it with `./flash serve dflash`. This adds a separate profile; the existing
 profiles and default selection are unchanged.
 
@@ -854,6 +857,7 @@ mmap patch should apply; we have not booted one ourselves.
 | `PROM_MULTIPROC` | `0` | `1` runs prometheus_client in multiprocess mode so engine-side metrics (`vllm:ple_mmap_*`) reach `/metrics`. Opt-in, because it stops vLLM exporting its `*_created` samples and the `process_*` / `python_*` metrics (`process_start_time_seconds` included; `vllm:ple_mmap_engine_start_time_seconds` stands in as a restart marker); see *Watching the mmapped table* below. |
 | `KV_CACHE_MEM` | | Passed through as `--kv-cache-memory-bytes`. `GPU_MEM` is a fraction of *total* device memory, so it leaves whatever was already resident on the table; vLLM prints the exact figure it would accept at startup ("Replace gpu_memory_utilization config with `--kv-cache-memory=...`"). On a Spark that headroom is also what the page cache uses for the PLE table, so taking it is a trade, not free memory — watch `vllm:ple_mmap_gather_seconds_total` when you do. |
 | `EXTRA` | | Extra vLLM flags, passed verbatim — e.g. `--long-prefill-token-threshold 1024` for multi-client responsiveness (see [the concurrency section](#decoding-clients-stall-while-other-clients-prefill-the-long-prefill-token-threshold-slider)), `--api-key <secret>`. |
+| `DOCKER_EXTRA` | | Extra `docker run` options, e.g. `-v /srv/certs:/certs:ro -e TRANSFORMERS_OFFLINE=1`. Whitespace separates arguments; embedded quotes, shell substitutions and wildcards are not evaluated. Paths and values must not contain whitespace. Shown in `DRY=1 ./flash serve` output. |
 
 ### Watching the mmapped table (`vllm:ple_mmap_*`)
 

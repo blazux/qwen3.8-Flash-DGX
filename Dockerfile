@@ -147,3 +147,6 @@ RUN cd ${SP} && patch --batch --forward --fuzz=0 -p1 < /tmp/qwen-mrope-cache-win
 # scripts/serve.sh dflash branch pins the V2 runner that init_speculator requires.
 COPY src/patch_dflash_qwen4exp.py /tmp/patch_dflash_qwen4exp.py
 RUN python3 /tmp/patch_dflash_qwen4exp.py ${SP} && rm /tmp/patch_dflash_qwen4exp.py
+
+# Advertise DFlash only after patch 23 has applied successfully (issue #64).
+LABEL qwen38.dflash=1

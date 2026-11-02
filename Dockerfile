@@ -4,7 +4,8 @@
 #   13 quoted Qwen tool markers stay text, 14 MoE weight-load clone (#33), 15-18 the rest of weight
 #   loading (pread, chunked embedding copy, MTP name prefilter), 19 token identity and Responses output,
 #   20 isolate the MTP drafter from target auxiliary outputs, 21 schema-validated tool arguments,
-#   22 cover the served M-RoPE window in the target and MTP drafter.
+#   22 cover the served M-RoPE window in the target and MTP drafter, 23 dflash/DFlash2 drafter seam
+#   for Qwen4Exp (vllm#56088).
 # Upstream now: 3 (vllm#50729), 7 (vllm#55557), 9 (vllm#52775),
 # 11 (vllm#55513), 16 (vllm#58720). Older bases remain in git history.
 #
@@ -138,3 +139,14 @@ COPY src/patches/qwen-mrope-cache-window.patch /tmp/qwen-mrope-cache-window.patc
 RUN cd ${SP} && patch --batch --forward --fuzz=0 -p1 < /tmp/qwen-mrope-cache-window.patch \
  && python3 -c "import ast; ast.parse(open('${SP}/vllm/model_executor/layers/rotary_embedding/mrope.py').read())" \
  && rm /tmp/qwen-mrope-cache-window.patch
+
+# --- 23. dflash/DFlash2 drafter seam on the Qwen4Exp target (vllm#56088) ---
+# Open the speculative-method allowlist, mount the EAGLE-3-style target
+# aux-hidden-state capture that DFlash drafting needs, and port the QSA ring
+# widening (vllm#54912) for speculation depths >= 5. Inert for the MTP path; the
+# scripts/serve.sh dflash branch pins the V2 runner that init_speculator requires.
+COPY src/patch_dflash_qwen4exp.py /tmp/patch_dflash_qwen4exp.py
+RUN python3 /tmp/patch_dflash_qwen4exp.py ${SP} && rm /tmp/patch_dflash_qwen4exp.py
+
+# Advertise DFlash only after patch 23 has applied successfully (issue #64).
+LABEL qwen38.dflash=1

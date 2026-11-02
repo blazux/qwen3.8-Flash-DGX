@@ -21,7 +21,8 @@
 #                     temperature 0 at no prefill cost. The default.
 #   EXACT_TOPK=0      1 = exact torch.topk fallback (also deterministic, but -20-40% long prefill); wins over DET_TOPK
 #   DRAFT_VOCAB=1     1 = the MTP drafter scores only the 65,536 most frequent tokens (+20% decode, same
-#                     tournament score); 0 = full vocabulary; a path = your own ids.npy (tools/build_draft_vocab.py)
+#                     tournament score); 0 = full vocabulary; a path = your own ids.npy (tools/build_draft_vocab.py).
+#                     MTP-head only; ignored when DRAFT_MODEL is set (DFlash2 requires the full verifier vocabulary).
 #   MADVISE=random    madvise on the mmapped PLE table: random (default; no readahead, cleaner page cache) or normal
 #   FAST_ROWS=0       PLE gathers of up to this many unique rows run inline on one thread, larger ones on the
 #                     WORKERS pool. 0 = every gather on the pool, so faults on rows the page cache dropped
@@ -52,10 +53,18 @@
 #   GPU_MEM=0.80      fraction of the 128 GB pool for weights+KV. 0.85 buys ~2 GiB of KV but the
 #                     box drifted into swap after a day at it; 0.875 got OOM-killed on a 300k prefill
 #   MTP=2             speculative tokens from the model's MTP head (0 = off)
+#   DRAFT_MODEL=      a HF draft model (org/name) for vLLM's dflash speculative decoding:
+#                     replaces the MTP head with a block-diffusion draft model (incoai's
+#                     DFlash2, 0.6B, ~1.2 GiB — scripts/download-draft.sh). MTP=0 is implied.
+#   DRAFT_TOKENS=4    speculative tokens for DRAFT_MODEL (the trained block is 8 =
+#                     anchor + 7; 4 is the measured arm on the GB10 - acceptance is
+#                     down to ~0.15 by position 4, so the deeper block buys little)
 #   KV_DTYPE=auto     auto (=bf16) recommended; fp8_e4m3 = x1.9 KV / 1M ctx at a speed+quality cost (README)
 #   PREWARM=0         1 = stream the 48 GiB table once at boot to warm the page cache
 #   WORKERS=32        threads for the mmap gather
 #   EXTRA=            extra vllm flags passed verbatim
+#   DOCKER_EXTRA=     extra docker run flags, whitespace-separated (no shell quoting/expansion;
+#                     paths/values must not contain whitespace); e.g. -v /srv/certs:/certs:ro
 #   COMPILE_CACHE=    where to keep vLLM's and FlashInfer's caches, Triton's kernels and the CUDA
 #                     driver's JIT cache across boots. Unset (default) = inside the container,
 #                     which this script recreates every time, so they are rebuilt on every boot
@@ -88,11 +97,24 @@ CPUSET="${CPUSET-5-9,15-19}"
 MAMBA_SSM_DTYPE="${MAMBA_SSM_DTYPE:-}"
 GPU_MEM="${GPU_MEM:-0.80}"
 MTP="${MTP:-2}"
+DRAFT_MODEL="${DRAFT_MODEL:-}"
+DRAFT_TOKENS="${DRAFT_TOKENS:-4}"
 KV_DTYPE="${KV_DTYPE:-auto}"
 KV_CACHE_MEM="${KV_CACHE_MEM:-}"
 PROM_MULTIPROC="${PROM_MULTIPROC:-0}"
 PREWARM="${PREWARM:-0}"
 EXTRA="${EXTRA:-}"
+DOCKER_EXTRA="${DOCKER_EXTRA:-}"
+# Split flags without eval, shell execution or pathname expansion.
+DOCKER_ARGS=()
+read -r -a DOCKER_ARGS <<< "${DOCKER_EXTRA//$'\n'/ }"
+
+SERVE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$SERVE_ROOT/scripts/image-capabilities.sh"
+if [ -n "$DRAFT_MODEL" ] && ! image_has_dflash; then
+  echo "!! $IMAGE lacks DFlash support (patch 23) — run ./flash setup dflash or rebuild this image from the current Dockerfile."
+  exit 1
+fi
 COMPILE_CACHE="${COMPILE_CACHE:-}"
 
 # Resolve the local snapshot directory and map it to the in-container mount.
@@ -151,7 +173,6 @@ SNAP_IN="/hf/hub/models--${MODEL//\//--}/snapshots/$SNAP_NAME"
 # manual `docker run` is root-owned, and this must not silently degrade to a 400 there). It is
 # bind-mounted read-only at a fixed path, so the location does not matter to the container or to
 # its --restart policy.
-SERVE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TEMPLATE_ARGS=()
 TEMPLATE_MNT=()
 EFFORT_ALIAS_STATE=off
@@ -215,8 +236,42 @@ if [ "$YARN" != 0 ]; then OVR_ARGS=(--hf-overrides "$YARN_OVR"); ALLOW_LONG=1; f
 # "--mamba-block-size can only be set with --enable-prefix-caching". Forcing the
 # draft's max_model_len through the speculative config fixes that startup check.
 # This sets the length limit only; it does not copy YaRN's RoPE parameters to MTP.
+# DRAFT_MODEL (a separate draft-model repo, e.g. incoai's DFlash2) replaces the MTP
+# head entirely: vLLM's dflash speculative method, a block-diffusion drafter verified
+# against the target's hidden states. It takes the same YaRN
+# max_model_len treatment as the MTP draft, and the draft snapshot is already on disk
+# under the HF cache mount, so no second mount or download at serve time.
+# STATUS 2026-10-27: the guard is opened in the image by patch 23
+# (src/patch_dflash_qwen4exp.py: allowlist + target aux-hidden-state seam + QSA ring,
+# per vllm-project/vllm#56088, recipe PixelML/deepspec-qwen38-flash-next/serving).
+# dflash is V2-runner-only, so the V2 runner is pinned here; rebuild the image
+# (./flash setup dflash or docker build) after pulling so patch 23 is present.
+# MEASURED 2026-10-28 (GX10, matched serving settings, context 500k, DRAFT_TOKENS=4):
+# 57.0 vs 45.2 tok/s with MTP=2 (+26% single-request throughput, including latency).
+# No quality degradation observed in validation; DFlash uses more GPU memory.
 SPEC=()
-if [ "$MTP" != 0 ]; then
+DRAFT_ENV=()
+if [ -n "$DRAFT_MODEL" ]; then
+  DRAFT_ENV=(-e VLLM_USE_V2_MODEL_RUNNER=1)  # init_speculator: dflash is a V2-runner path
+  DRAFT_HOST=""
+  DRAFT_REPO_DIR="$HF_CACHE/hub/models--${DRAFT_MODEL//\//--}"
+  for REF in main master; do
+    REV="$(cat "$DRAFT_REPO_DIR/refs/$REF" 2>/dev/null || true)"
+    if [ -n "$REV" ] && [ -d "$DRAFT_REPO_DIR/snapshots/$REV" ]; then DRAFT_HOST="$DRAFT_REPO_DIR/snapshots/$REV"; break; fi
+  done
+  DRAFT_HOST="${DRAFT_HOST:-$(ls -dt "$DRAFT_REPO_DIR"/snapshots/*/ 2>/dev/null | head -1 | sed 's:/$::' || true)}"
+  if [ -z "$DRAFT_HOST" ] || [ ! -f "$DRAFT_HOST/config.json" ]; then
+    echo "!! DRAFT_MODEL '$DRAFT_MODEL' not downloaded: run scripts/download-draft.sh first (one-time, ~1.2 GiB)."
+    exit 1
+  fi
+  DRAFT_IN="/hf/hub/models--${DRAFT_MODEL//\//--}/snapshots/$(basename "$DRAFT_HOST")"
+  if [ "$YARN" != 0 ]; then
+    SPEC=(--speculative-config "{\"method\":\"dflash\",\"model\":\"$DRAFT_IN\",\"num_speculative_tokens\":${DRAFT_TOKENS},\"max_model_len\":${CTX}}")
+  else
+    SPEC=(--speculative-config "{\"method\":\"dflash\",\"model\":\"$DRAFT_IN\",\"num_speculative_tokens\":${DRAFT_TOKENS}}")
+  fi
+  echo ">> DRAFT_MODEL $DRAFT_MODEL replaces the MTP head (MTP=$MTP ignored); speculative config: method=dflash, $DRAFT_TOKENS draft tokens"
+elif [ "$MTP" != 0 ]; then
   if [ "$YARN" != 0 ]; then
     SPEC=(--speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":${MTP},\"max_model_len\":${CTX}}")
   else
@@ -240,11 +295,18 @@ SSM_ARGS=()
 [ -n "$MAMBA_SSM_DTYPE" ] && SSM_ARGS=(--mamba-ssm-cache-dtype "$MAMBA_SSM_DTYPE")
 
 DETENV=(); [ "$DET_TOPK" = 1 ] && DETENV=(-e VLLM_QSA_DET_TOPK=1 -e VLLM_QSA_DET_LIB=/opt/llm/kernel-det/_C_det.so)
-case "$DRAFT_VOCAB" in
-  0|"") ;;
-  1) DETENV+=(-e VLLM_MTP_DRAFT_VOCAB=/opt/llm/draft_vocab_65536.npy) ;;
-  *) DETENV+=(-e VLLM_MTP_DRAFT_VOCAB="$DRAFT_VOCAB") ;;
-esac
+# VLLM_MTP_DRAFT_VOCAB prunes the MTP head's vocabulary. Under DRAFT_MODEL there is no MTP
+# head, and DFlash2 requires the FULL verifier vocabulary (pruned draft vocabularies are
+# rejected), so the prune is skipped entirely for the dflash path regardless of DRAFT_VOCAB.
+if [ -n "$DRAFT_MODEL" ]; then
+  case "$DRAFT_VOCAB" in 0|"") ;; *) echo ">> note: DRAFT_VOCAB=$DRAFT_VOCAB is an MTP-head setting, not applied to the dflash draft (DFlash2 needs the full verifier vocabulary)." ;; esac
+else
+  case "$DRAFT_VOCAB" in
+    0|"") ;;
+    1) DETENV+=(-e VLLM_MTP_DRAFT_VOCAB=/opt/llm/draft_vocab_65536.npy) ;;
+    *) DETENV+=(-e VLLM_MTP_DRAFT_VOCAB="$DRAFT_VOCAB") ;;
+  esac
+fi
 DETENV+=(-e VLLM_PLE_MMAP_MADVISE="$MADVISE")
 # The module reads this with a silent fallback to 512 on anything unparsable, so refuse a bad value here.
 case "$FAST_ROWS" in ''|*[!0-9]*) echo "!! FAST_ROWS must be a non-negative integer (0 = thread pool for every gather, 512 = old inline path)"; exit 1 ;; esac
@@ -340,7 +402,8 @@ docker run -d --name "$NAME" --restart unless-stopped \
   -e VLLM_PLE_MMAP=1 -e VLLM_PLE_MMAP_WORKERS="${WORKERS:-32}" -e VLLM_PLE_MMAP_PREWARM="$PREWARM" \
   -e VLLM_QSA_EXACT_TOPK="$EXACT_TOPK" "${DETENV[@]}" \
   -e VLLM_USE_FLASHINFER_SAMPLER=1 -e VLLM_ALLOW_LONG_MAX_MODEL_LEN="$ALLOW_LONG" \
-  "${HYBRID_ENV[@]}" \
+  "${HYBRID_ENV[@]}" "${DRAFT_ENV[@]}" \
+  "${DOCKER_ARGS[@]}" \
   "$IMAGE" \
   "$SNAP_IN" --served-model-name "$SERVED_MODEL_NAME" \
     --host 0.0.0.0 --port 8000 --load-format safetensors \
@@ -369,6 +432,6 @@ case "$STATE" in
     ;;
 esac
 
-echo ">> $NAME starting on :$PORT (model '$SERVED_MODEL_NAME', mode=$MODE, ctx $CTX, yarn=$YARN, mtp=$MTP, seqs=$SEQS, prefix_cache=$PREFIX_CACHE, det_topk=$DET_TOPK, exact_topk=$EXACT_TOPK, draft_vocab=$DRAFT_VOCAB, madvise=$MADVISE, fast_rows=$FAST_ROWS, effort_alias=$EFFORT_ALIAS_STATE${CPUSET:+, cpuset=$CPUSET}${MAMBA_SSM_DTYPE:+, ssm_dtype=$MAMBA_SSM_DTYPE}${COMPILE_CACHE:+, compile_cache=$COMPILE_CACHE})"
+echo ">> $NAME starting on :$PORT (model '$SERVED_MODEL_NAME', mode=$MODE, ctx $CTX, yarn=$YARN, mtp=$MTP${DRAFT_MODEL:+, draft_model=$DRAFT_MODEL tokens=$DRAFT_TOKENS}, seqs=$SEQS, prefix_cache=$PREFIX_CACHE, det_topk=$DET_TOPK, exact_topk=$EXACT_TOPK, draft_vocab=$DRAFT_VOCAB, madvise=$MADVISE, fast_rows=$FAST_ROWS, effort_alias=$EFFORT_ALIAS_STATE${CPUSET:+, cpuset=$CPUSET}${MAMBA_SSM_DTYPE:+, ssm_dtype=$MAMBA_SSM_DTYPE}${COMPILE_CACHE:+, compile_cache=$COMPILE_CACHE})"
 echo ">> first boot loads ~75 GiB of weights (~3-4 min). Follow:  docker logs -f $NAME"
 echo ">> ready when the log says 'Application startup complete'. Then: scripts/smoke-test.sh"

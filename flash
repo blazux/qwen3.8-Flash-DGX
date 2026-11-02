@@ -21,6 +21,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROFILES_DIR="$HERE/profiles"
 source "$HERE/scripts/image-capabilities.sh"
+source "$HERE/scripts/api-client.sh"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/qwen38-flash"
 MODEL_DEFAULT="nvidia/Qwen3.8-Flash-Next-NVFP4"   # default since 2026-09-14 (README: Checkpoints); RadixArk/Qwen3.8-Flash-Next-NVFP4 still supported
 DRY="${DRY:-0}"
@@ -150,7 +151,7 @@ have_draft() { local s; s="$(draft_snapshot_dir)"; [ -n "$s" ] && [ -f "$s/confi
 image_base()    { docker image inspect -f '{{index .Config.Labels "qwen38.base"}}' "$IMAGE" 2>/dev/null || true; }
 container_state() { docker inspect -f '{{.State.Status}}' "$NAME" 2>/dev/null || echo absent; }
 port_in_use()   { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
-api_up()        { curl -sf -m 3 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; }
+api_up()        { api_curl -sf -m 3 "$API_BASE/health" >/dev/null 2>&1; }
 gib_free_at()   { df -BG --output=avail "$1" 2>/dev/null | tail -1 | tr -dc '0-9'; }
 mem_kb()        { awk -v k="$1" '$1==k":"{print $2}' /proc/meminfo; }
 
@@ -321,8 +322,9 @@ cmd_serve() {
 cmd_wait() {
   load_defaults_only
   local t0 deadline last="" state
+  API_BASE="$(api_base)" || return 1
   t0=$(date +%s); deadline=$((t0 + ${TIMEOUT:-1800}))
-  echo "waiting for $NAME on :$PORT (first boot loads ~75 GiB: ~3-4 min; ctrl-c is safe, the server keeps loading)"
+  echo "waiting for $NAME at $API_BASE (first boot loads ~75 GiB: ~3-4 min; ctrl-c is safe, the server keeps loading)"
   while :; do
     state="$(container_state)"
     case "$state" in
@@ -332,9 +334,9 @@ cmd_wait() {
     esac
     if api_up; then
       printf '\r%-100s\n' "  ready after $(( $(date +%s) - t0 )) s."
-      docker logs "$NAME" 2>&1 | grep -E 'GPU KV cache size|Maximum concurrency' | tail -1 | sed 's/.*\[kv_cache_utils.*\] /  /'
-      MODEL_NAME="$(curl -sf -m 3 "http://127.0.0.1:$PORT/v1/models" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"][0]["id"])' 2>/dev/null || echo unknown)"
-      echo "  API: http://localhost:$PORT/v1  (model '$MODEL_NAME')   try: ./flash test"
+      docker logs "$NAME" 2>&1 | grep -E 'GPU KV cache size|Maximum concurrency' | tail -1 | sed 's/.*\[kv_cache_utils.*\] /  /' || true
+      MODEL_NAME="$(api_curl -sf -m 3 "$API_BASE/v1/models" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"][0]["id"])' 2>/dev/null || echo unknown)"
+      echo "  API: $API_BASE/v1  (model '$MODEL_NAME')   try: ./flash test"
       return 0
     fi
     local l e; l="$(docker logs --tail 40 "$NAME" 2>&1 | grep -E 'Loading safetensors|Loading weights took|Model loading took|torch.compile took|Capturing CUDA|KV cache size|prewarm|startup' | tail -1 | sed -E 's/.*\] //; s/^Model loading took ([0-9.]+ [KMGT]iB)( memory)? and ([0-9]+)(\.[0-9]+)? seconds[[:space:]]*$/\1 model loading took \3s/' | cut -c1-92 || true)"
@@ -351,16 +353,17 @@ cmd_status() {
   [ "$state" = absent ] && return 0
   docker ps -a --filter "name=^${NAME}$" --format '  image {{.Image}}   {{.Status}}   {{.Ports}}'
   if [ "$state" = running ]; then
-    if api_up; then ok "API answering on :$PORT"; else info "loading (API not up yet) — ./flash wait"; fi
+    API_BASE="$(api_base)" || return 1
+    if api_up; then ok "API answering at $API_BASE"; else info "loading (API not up yet) — ./flash wait"; fi
     local lg; lg="$(docker logs "$NAME" 2>&1)"
-    echo "$lg" | grep -E 'GPU KV cache size' | tail -1 | sed -E 's/^\([^)]*\) //; s/.*\] /  /'
+    echo "$lg" | grep -E 'GPU KV cache size' | tail -1 | sed -E 's/^\([^)]*\) //; s/.*\] /  /' || true
     {
       echo "$lg" | grep -E 'QSADET active' | tail -1 | sed -E 's/^\([^)]*\) //; s/.*\] //; s/^/deterministic top-k: /'
       echo "$lg" | grep -E 'reduced draft vocabulary enabled' | tail -1 | sed -E 's/^\([^)]*\) //; s/.*\] //'
       echo "$lg" | grep -E 'fp8 hybrid: [0-9]+ fused modules' | tail -1 | sed -E 's/^\([^)]*\) //; s/.*\] //; s/ so far.*//'
       echo "$lg" | grep -E 'PLE mmap: (table|serving|prewarm)' | tail -1 | sed -E 's/^\([^)]*\) //; s/.*\] //'
-    } | grep -v '^$' | sed 's/^/  /'
-    local m; m="$(curl -sf -m 3 "http://127.0.0.1:$PORT/metrics" 2>/dev/null || true)"
+    } | grep -v '^$' | sed 's/^/  /' || true
+    local m; m="$(api_curl -sf -m 3 "$API_BASE/metrics" 2>/dev/null || true)"
     if [ -n "$m" ]; then
       echo "$m" | awk '/^vllm:num_requests_running/{r=$2} /^vllm:prefix_cache_hits_total/{h+=$2} /^vllm:prefix_cache_queries_total/{q+=$2} END{printf "  running requests: %d   prefix-cache hit rate: %s\n", r, (q>0? sprintf("%.0f%%",100*h/q):"n/a")}'
     fi
@@ -382,7 +385,7 @@ main() {
     wait)     cmd_wait ;;
     status)   cmd_status ;;
     profiles) cmd_profiles ;;
-    test)     load_defaults_only; exec "$HERE/scripts/smoke-test.sh" "localhost:$PORT" ;;
+    test)     load_defaults_only; API_BASE="$(api_base)" || return 1; exec "$HERE/scripts/smoke-test.sh" "$API_BASE" ;;
     logs)     load_defaults_only; exec docker logs -f --tail "${1:-100}" "$NAME" ;;
     stop)     load_defaults_only; docker stop -t 30 "$NAME" && echo "$NAME stopped (kept; ./flash start reloads the same recipe, ~3-4 min)" ;;
     start)    load_defaults_only; docker start "$NAME" >/dev/null && echo "$NAME starting — ./flash wait" ;;

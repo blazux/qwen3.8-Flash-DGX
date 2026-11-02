@@ -859,6 +859,29 @@ mmap patch should apply; we have not booted one ourselves.
 | `EXTRA` | | Extra vLLM flags, passed verbatim — e.g. `--long-prefill-token-threshold 1024` for multi-client responsiveness (see [the concurrency section](#decoding-clients-stall-while-other-clients-prefill-the-long-prefill-token-threshold-slider)), `--api-key <secret>`. |
 | `DOCKER_EXTRA` | | Extra `docker run` options, e.g. `-v /srv/certs:/certs:ro -e TRANSFORMERS_OFFLINE=1`. Whitespace separates arguments; embedded quotes, shell substitutions and wildcards are not evaluated. Paths and values must not contain whitespace. Shown in `DRY=1 ./flash serve` output. |
 
+### API connection and TLS
+
+`./flash wait`, `./flash status` and `./flash test` read the running container's
+API arguments and published port. They select HTTPS when `--ssl-certfile` is set,
+even if the current shell has a different `PORT`. Select another container with
+`NAME=...`; an explicit `FLASH_API_BASE=https://hostname:port` overrides discovery
+(for example, host networking or a hostname required by the certificate).
+
+TLS certificates are verified by default. For a private/self-signed CA, use
+`FLASH_CA=/path/to/ca.pem` on the **host**. `CURL_CA_BUNDLE`, `CURL_CAINFO` and
+`SSL_CERT_FILE` are also supported, in that order after `FLASH_CA`. These settings
+apply to both curl and Python requests. For a local test with an untrusted
+certificate, `FLASH_INSECURE=1` explicitly disables certificate verification.
+
+```bash
+FLASH_CA=/srv/certs/ca.pem FLASH_API_BASE=https://spark.example:8000 ./flash wait
+FLASH_CA=/srv/certs/ca.pem FLASH_API_BASE=https://spark.example:8000 ./flash test
+# Explicit opt-out for a local self-signed endpoint:
+FLASH_INSECURE=1 ./flash status
+# Direct smoke tests accept a full URL; host:port still defaults to HTTP:
+FLASH_CA=/srv/certs/ca.pem scripts/smoke-test.sh https://spark.example:8000
+```
+
 ### Watching the mmapped table (`vllm:ple_mmap_*`)
 
 The PLE table is the one component whose cost depends on runtime state rather than

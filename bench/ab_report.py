@@ -128,14 +128,15 @@ def main():
     for n in names:
         s = arms[n]["meta"].get("server") or {}
         argsets[n] = s.get("vllm_args") or []
-        pool = s.get("kv_cache_tokens")
+        pool, mc = s.get("kv_cache_tokens"), s.get("max_concurrency")
+        pool_str = f"{pool:,}" if isinstance(pool, int) else "-"
+        mc_str = f"{mc:.2f}x" if isinstance(mc, (int, float)) else "-"
         print(f"   {n:<14} {s.get('image', '-')}"
               f"\n   {'':<14} ctx {s.get('ctx', '-')}  seqs {s.get('max_num_seqs', '-')}"
               f"  gpu_mem {s.get('gpu_memory_utilization', '-')}"
               f"  kv {s.get('kv_cache_dtype', '-')}"
               f"  draft_vocab {s.get('draft_vocab', '-')}"
-              f"\n   {'':<14} KV pool {f'{pool:,}' if isinstance(pool, int) else '-'} tok"
-              f"  max concurrency {s.get('max_concurrency', '-')}x"
+              f"\n   {'':<14} KV pool {pool_str} tok  max concurrency {mc_str}"
               f"  spec {s.get('speculative_config', '-')}")
         if isinstance(pool, int) and isinstance(s.get("ctx"), int) and pool < s["ctx"]:
             warns.append(f"!! {n}: the KV pool ({pool:,} tok) is smaller than the advertised "

@@ -121,7 +121,7 @@ except ValueError:
 
 log = subprocess.run(["docker", "logs", container], capture_output=True, text=True).stdout
 kv = re.search(r"GPU KV cache size: ([\d,]+) tokens", log)
-mc = re.search(r"Maximum concurrency: ([\d.]+)x", log)
+mc = re.search(r"Maximum concurrency.*?:\s*([\d.]+)x", log)   # both vLLM wordings
 mem = {}
 try:
     for line in open("/proc/meminfo"):

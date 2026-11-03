@@ -43,8 +43,8 @@ CODE_PROMPT = (
 def chat(prompt, max_tokens, thinking=False, stream=False, timeout=3600):
     """One chat completion.
 
-    Returns a dict with e2e seconds, completion/prompt token counts, and (when
-    streaming) ttft. Always count `completion_tokens` over wall time rather than
+    Returns a dict with e2e seconds, completion/prompt token counts, cached_tokens,
+    and (when streaming) ttft. Always count `completion_tokens` over wall time rather than
     counting stream events: speculative decoding emits several tokens per event,
     so event-counting inflates the rate by roughly the acceptance length.
     """
@@ -71,13 +71,22 @@ def chat(prompt, max_tokens, thinking=False, stream=False, timeout=3600):
             "ttft": None,
             "completion_tokens": usage["completion_tokens"],
             "prompt_tokens": usage["prompt_tokens"],
+            # Anything above 0 here means the radix cache served part of this prompt, so the
+            # timing belongs to the cache and not to the model (serve.sh enables
+            # --enable-prompt-tokens-details precisely so benchmarks can show this).
+            "cached_tokens": (usage.get("prompt_tokens_details") or {}).get("cached_tokens"),
             "finish_reason": d["choices"][0].get("finish_reason"),
             "content": d["choices"][0]["message"].get("content") or "",
+            "text": ((d["choices"][0]["message"].get("reasoning") or "")
+                     + (d["choices"][0]["message"].get("content") or "")),
         }
 
     ttft = None
     completion_tokens = 0
     prompt_tokens = 0
+    cached_tokens = None
+    content = []
+    text = []
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         for raw in resp:
             line = raw.decode().strip()
@@ -91,20 +100,31 @@ def chat(prompt, max_tokens, thinking=False, stream=False, timeout=3600):
             except ValueError:
                 continue
             choices = d.get("choices") or []
-            if choices and ttft is None:
+            if choices:
                 delta = choices[0].get("delta", {}) or {}
                 # vLLM's qwen3 reasoning parser uses "reasoning"; SGLang and the
                 # OpenAI reasoning API use "reasoning_content".
-                if delta.get("content") or delta.get("reasoning") or delta.get("reasoning_content"):
+                part = delta.get("content") or ""
+                think = delta.get("reasoning") or delta.get("reasoning_content") or ""
+                if (part or think) and ttft is None:
                     ttft = time.time() - t0
+                content.append(part)
+                text.append(think + part)
             if d.get("usage"):
                 completion_tokens = d["usage"].get("completion_tokens", completion_tokens)
                 prompt_tokens = d["usage"].get("prompt_tokens", prompt_tokens)
+                cached_tokens = (d["usage"].get("prompt_tokens_details")
+                                 or {}).get("cached_tokens", cached_tokens)
     return {
         "e2e": time.time() - t0,
         "ttft": ttft,
         "completion_tokens": completion_tokens,
         "prompt_tokens": prompt_tokens,
+        "cached_tokens": cached_tokens,
         "finish_reason": None,
-        "content": "",
+        # Streaming keeps the text: `content` is the answer field (same meaning as the
+        # non-streaming return), `text` adds the reasoning tokens, so a caller can hash
+        # everything the run actually produced.
+        "content": "".join(content),
+        "text": "".join(text),
     }

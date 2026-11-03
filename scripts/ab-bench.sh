@@ -149,6 +149,48 @@ print("   KV pool {} tok   ctx {}   draft_vocab {}   v2_runner {}".format(
 PY
 }
 
+show_boot_failure() {   # show_boot_failure <container> <file> — why the engine gave up
+  local container="$1" file="$2"
+  docker logs "$container" > "$file" 2>&1 || true
+  echo "   full log: $file"
+  docker inspect -f '   {{.State.Status}} exit={{.State.ExitCode}} oom_killed={{.State.OOMKilled}}' \
+    "$container" 2>/dev/null || echo "   (no container $container to inspect)"
+  # ./flash wait prints the TAIL of the log, which is where wait() noticed the engine died,
+  # not why. The line that matters is the first exception, so grab those instead.
+  python3 - "$file" <<'PY'
+import re, sys
+try:
+    lines = open(sys.argv[1], errors="replace").read().splitlines()
+except OSError:
+    sys.exit()
+shown = set()
+
+
+def say(i, tag):
+    if i not in shown:                  # one line may match several patterns
+        shown.add(i)
+        print(f"   {tag} {lines[i].strip()[:300]}")
+
+
+for pat, tag in (
+    (r"^(Traceback \(most recent call last\):)$", "traceback:"),
+    (r"^[A-Za-z_][\w.]*(Error|Exception|Warning):", "exception:"),
+    (r"\bERROR\b.*\b(vllm|engine|Worker)", "error log:"),
+    (r"QSA ring|speculative|block size|mamba", "config hint:"),
+    (r"out of memory|OOM|KV cache size", "memory:"),
+):
+    hits = [i for i, l in enumerate(lines) if re.search(pat, l)][:4]
+    for i in hits:
+        say(i, tag)
+    if hits:
+        print("   ---")
+if not shown:                      # nothing matched: at least show where it stopped
+    print("   --- no exception found; last lines ---")
+    for j in range(max(0, len(lines) - 12), len(lines)):
+        say(j, "(tail)")
+PY
+}
+
 FAILED=()
 for block in $(seq 1 "$BLOCKS"); do
   # ABBA: block 1 runs the arms in order, block 2 reversed, ... so no arm always boots after a
@@ -167,11 +209,12 @@ for block in $(seq 1 "$BLOCKS"); do
       continue
     fi
     if ! PROM_MULTIPROC=1 NAME="$NAME" PORT="$PORT" "$FLASH" serve "$profile"; then
-      echo "   !! serve failed"; FAILED+=("$profile.b$block:serve"); continue
+      echo "   !! serve failed (the container never started)"
+      FAILED+=("$profile.b$block:serve"); continue
     fi
     if ! NAME="$NAME" PORT="$PORT" "$FLASH" wait; then
-      echo "   !! the server never came up — last log lines:"
-      docker logs --tail 30 "$NAME" 2>&1 | sed 's/^/      /'
+      echo "   !! the server never came up"
+      show_boot_failure "$NAME" "$OUT_DIR/$profile.b$block.boot.log"
       FAILED+=("$profile.b$block:boot"); continue
     fi
     capture_meta "$OUT_DIR/$profile.b$block.meta.json" "$NAME"

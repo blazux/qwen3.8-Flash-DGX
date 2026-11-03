@@ -357,6 +357,8 @@ Profiles (`profiles/*.env`, each a handful of `serve.sh` variables; copy one to 
 | `concurrent` | default + `SEQS=16`, `MAMBA_SSM_DTYPE=bfloat16`; uses the default CPUSET `5-9,15-19` | higher aggregate throughput with parallel clients; [measured with FP8 KV and an 8 GiB pool](#measured-concurrent-profile-pr-54) |
 | `context` | `MODE=hybrid-mtp` (NVFP4 MTP draft experts) | +22% KV pool for concurrency or long contexts, decode unchanged |
 | `context-1m` | hybrid + `KV_DTYPE=fp8_e4m3`, 1M context | when you need 1M tokens in one request (small speed cost) |
+| `dflash-1m` | `dflash` at 1M context (`KV_DTYPE=fp8_e4m3`) | DFlash2 drafting with 1M tokens in one request |
+| `mtp4-1m` | `context-1m` with `MTP=4`, `DRAFT_VOCAB=0` | the matched A/B baseline for `dflash-1m`: same K=4, same full draft vocabulary |
 | `shared` | default + `--long-prefill-token-threshold 1024` | several clients at once: decoding stays responsive while others prefill, single-stream TTFT −17–36% |
 | `published` | `MODE=nvfp4`, YaRN 500k | the checkpoint exactly as published, nothing to prepare; ~26 tok/s |
 | `native` | hybrid, 262k, no YaRN | if you never go past the native context |
@@ -1137,9 +1139,22 @@ export GB10_MODEL=qwen3.8-flash-next
 
 python3 bench/perf.py             # TTFT, single-stream decode, concurrency sweep, prefill curve
 python3 bench/longctx.py          # concurrent long-context; unique content per stream
+
+./scripts/ab-bench.sh             # A/B two profiles boot-to-evidence (default: mtp4-1m vs dflash-1m)
+python3 bench/ab_report.py results/ab/*.jsonl --baseline mtp4-1m
 ./scripts/run-humaneval.sh        # HumanEval pass@1, low reasoning effort
 ./scripts/run-humaneval.sh think  # xhigh reasoning effort
 ```
+
+`scripts/ab-bench.sh` is the one to use for a drafter question (MTP vs DFlash2 above). Only one
+model fits on the box at a time, so it boots the arms in turn — alternating the order per block
+(AB BA) so drift lands on both sides — and it holds both arms to the same recipe everywhere else:
+the same seeded prompt stream, `PROM_MULTIPROC=1` so `vllm:spec_decode_*` reaches `/metrics` and
+the tok/s comes with the acceptance rate behind it, `DRAFT_VOCAB=0` on the MTP arm because DFlash2
+cannot use the pruned vocabulary, and the greedy outputs hashed per rep, since a lossless draft
+must not change a single token. `bench/ab_report.py` exits non-zero when the two boots differ in
+any engine argument apart from `--speculative-config`, or when the KV pool came out under the
+advertised context — the two ways these comparisons usually lie.
 
 Everything is env-driven (`GB10_BASE_URL`, `GB10_API_KEY`, `GB10_MODEL` — see
 `bench/common.py`) and the scripts are self-locating, so nothing is path-dependent.
@@ -1242,7 +1257,8 @@ Details: [results-radixark-vllm.md](https://github.com/jschmied/qwen38-flash-nex
 
 ```
 flash                             one-command front-end: doctor / setup / serve <profile> / wait / test / status …
-profiles/*.env                    named recipes (default, speed, concurrent, context, context-1m, shared, published, native)
+profiles/*.env                    named recipes (default, speed, concurrent, context, context-1m, shared, published,
+                                    native, dflash, dflash-1m, mtp4-1m)
 Dockerfile                        official vLLM v0.32.0 image + the patches below (qwen38-flash-dgx:v0.32).
                                      Native upstream now: 3, 7, 9, 11, 16 (docs/HISTORY.md, docs/VLLM-031.md)
 src/vllm_ple_mmap.py              1. mmap PLE table (opaque op, breaks the CUDA-graph capture)  VLLM_PLE_MMAP=1
@@ -1299,8 +1315,10 @@ tools/vllm_watch.py               live per-session view of prompts / reasoning /
 scripts/serve.sh                  MODE=nvfp4|hybrid|hybrid-mtp, SERVED_MODEL_NAME, PREFIX_CACHE, DET_TOPK, DRAFT_VOCAB, DRAFT_MODEL, DRAFT_TOKENS, MADVISE, EXACT_TOPK, KV_DTYPE, YARN, ...
 scripts/smoke-test.sh             health, coherence, prefix-cache hit, determinism, tok/s
 scripts/greedy-probe.sh           greedy probe set; diff two arms to gate a draft/checkpoint swap
+scripts/ab-bench.sh             boot-to-evidence A/B of two profiles (bench/ab.py per arm, ABBA blocks)
 scripts/run-humaneval.sh          HumanEval end-to-end: generate -> sandboxed execution -> report
-bench/                            perf.py (TTFT/decode/concurrency/prefill), longctx.py, humaneval/ — the benchmark suite
+bench/                            perf.py (TTFT/decode/concurrency/prefill), longctx.py, ab.py + ab_report.py (the
+                                    A/B harness), humaneval/ — the benchmark suite
 docs/HOW-IT-WORKS.md              how each patch works, with the measurements
 docs/VLLM-031.md                  v0.31 migration, serving validation and automatic KV sizing diagnostics
 docs/SAFE-OUTPUT.md               parser/Responses fixes, Chat compatibility and validation scope

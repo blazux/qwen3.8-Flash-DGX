@@ -357,8 +357,8 @@ Profiles (`profiles/*.env`, each a handful of `serve.sh` variables; copy one to 
 | `concurrent` | default + `SEQS=16`, `MAMBA_SSM_DTYPE=bfloat16`; uses the default CPUSET `5-9,15-19` | higher aggregate throughput with parallel clients; [measured with FP8 KV and an 8 GiB pool](#measured-concurrent-profile-pr-54) |
 | `context` | `MODE=hybrid-mtp` (NVFP4 MTP draft experts) | +22% KV pool for concurrency or long contexts, decode unchanged |
 | `context-1m` | hybrid + `KV_DTYPE=fp8_e4m3`, 1M context | when you need 1M tokens in one request (small speed cost) |
-| `dflash-1m` | `dflash` at 1M context (`KV_DTYPE=fp8_e4m3`) | DFlash2 drafting with 1M tokens in one request |
-| `mtp4-1m` | `context-1m` with `MTP=4`, `DRAFT_VOCAB=0` | the matched A/B baseline for `dflash-1m`: same K=4, same full draft vocabulary |
+| `dflash-1m` | `dflash` at 1M context (`KV_DTYPE=fp8_e4m3`, `MAMBA_SSM_DTYPE=bfloat16`) | DFlash2 drafting with 1M tokens in one request: the halved GDN state pool is what fits the drafter inside the 1M KV budget |
+| `mtp4-1m` | `context-1m` with `MTP=4`, `DRAFT_VOCAB=0`, `MAMBA_SSM_DTYPE=bfloat16` | the matched A/B baseline for `dflash-1m`: same K=4, same full draft vocabulary, same state dtype |
 | `shared` | default + `--long-prefill-token-threshold 1024` | several clients at once: decoding stays responsive while others prefill, single-stream TTFT −17–36% |
 | `published` | `MODE=nvfp4`, YaRN 500k | the checkpoint exactly as published, nothing to prepare; ~26 tok/s |
 | `native` | hybrid, 262k, no YaRN | if you never go past the native context |

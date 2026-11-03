@@ -155,6 +155,17 @@ show_boot_failure() {   # show_boot_failure <container> <file> — why the engin
   echo "   full log: $file"
   docker inspect -f '   {{.State.Status}} exit={{.State.ExitCode}} oom_killed={{.State.OOMKilled}}' \
     "$container" 2>/dev/null || echo "   (no container $container to inspect)"
+  local restarts
+  restarts="$(docker inspect -f '{{.RestartCount}}' "$container" 2>/dev/null || echo 0)"
+  if [ "${restarts:-0}" != "0" ]; then
+    # serve.sh starts the container with --restart unless-stopped, so a config vLLM refuses
+    # becomes an endless re-load of ~73 GiB from NVMe every few minutes — and it keeps going
+    # after this script moves on or exits. Only RestartCount says "it has already died": a
+    # container that is merely slow to boot sits at 0 and must be left alone.
+    echo "   crash-restarting after $restarts attempt(s) — stopping the loop"
+    docker update --restart=no "$container" >/dev/null 2>&1 || true
+    docker stop -t 20 "$container" >/dev/null 2>&1 || true
+  fi
   # ./flash wait prints the TAIL of the log, which is where wait() noticed the engine died,
   # not why. The line that matters is the first exception, so grab those instead.
   python3 - "$file" <<'PY'
@@ -184,7 +195,31 @@ for pat, tag in (
         say(i, tag)
     if hits:
         print("   ---")
-if not shown:                      # nothing matched: at least show where it stopped
+# vLLM states the context length its KV pool would actually fit. A boot that died on that
+# check is a result, not just a failure — so turn it into the number to put in the report.
+text = "\n".join(lines)
+need = re.search(r"max seq len \((\d+)\), \(?([\d.]+) ?GiB KV cache is needed, which is larger "
+                 r"than the available KV cache memory \(([\d.]+) ?GiB", text)
+cap = re.search(r"estimated maximum model length is ([\d,]+)", text)
+if cap:
+    line = f"   ceiling: this arm boots to CTX={int(cap.group(1).replace(',', '')):,}"
+    if need:
+        short = float(need.group(2)) - float(need.group(3))
+        line += f" not {int(need.group(1)):,} — {short:.1f} GiB short of KV"
+        pool = 0.0
+        try:
+            for mem in open("/proc/meminfo"):
+                if mem.startswith("MemTotal:"):
+                    pool = int(mem.split()[1]) / 1048576       # GiB of the unified pool
+        except OSError:
+            pass
+        util = re.search(r"gpu-memory-utilization=(\d*\.?\d+)", text)
+        if pool and util:
+            want = float(util.group(1)) + short / pool
+            line += (f"; GPU_MEM {float(util.group(1)):.2f} -> {want:.3f} covers it"
+                     + (" (past the 0.85 the recipe warns swaps)" if want > 0.85 else ""))
+    print(line)
+if not shown and not cap:            # nothing matched: at least show where it stopped
     print("   --- no exception found; last lines ---")
     for j in range(max(0, len(lines) - 12), len(lines)):
         say(j, "(tail)")

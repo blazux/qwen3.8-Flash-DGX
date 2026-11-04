@@ -169,7 +169,7 @@ cmd_profiles() {
     first=0
     printf '%-12s %s\n' "$p" "$(profile_meta "$f" desc)"
   done
-  printf '\nserve one:  ./flash serve <profile>        override anything:  ./flash serve default MTP=3 PORT=18301\n'
+  printf '\nserve one:  ./flash serve <profile>        override anything:  ./flash serve default BATCH_TOKENS=8192 PORT=18301\n'
   printf 'a profile is a plain env file in profiles/ — copy one to make your own.\n'
 }
 

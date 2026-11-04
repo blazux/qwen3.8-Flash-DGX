@@ -24,39 +24,32 @@ kernel that drops candidates) — and offers an optional **hybrid** checkpoint l
 git clone https://github.com/blazux/qwen3.8-Flash-DGX.git && cd qwen3.8-Flash-DGX
 ./flash doctor      # docker, GPU, memory, disk, port, image, weights: tells you what is missing
 ./flash setup       # builds the image, downloads the checkpoint (NVIDIA's NVFP4, 124 GiB via Xet, resumable), prepares the hybrid layout
-./flash serve       # the recommended recipe (profile "default"): hybrid, 500k context, deterministic
+./flash serve       # mtp-fast by default: MTP3 with an NVFP4 proposal head, 16k batch, 500k context
 ./flash wait        # first boot loads ~75 GiB of weights, ~3-4 min (patches 14-18); prints the KV pool when the API is up
 ./flash test        # health, coherence, prefix-cache hit, determinism, tok/s
 ```
 
-Other recipes are one word away: `./flash profiles` lists them (`speed`, `concurrent`, `context`, `context-1m`,
+Other recipes are one word away: `./flash profiles` lists them (`mtp-standard`, `speed`, `concurrent`, `context`, `context-1m`,
 `shared`, `published`, `native`, `dflash`), `./flash serve speed` runs one, and any variable can still
-be overridden on the command line (`./flash serve default MTP=3 PORT=18301`). `./flash status`,
+be overridden on the command line (`./flash serve BATCH_TOKENS=8192 PORT=18301`). `./flash status`,
 `logs`, `stop`, `start`, `rm` do what they say. Details in [The `flash` command](#the-flash-command).
 
-The same thing by hand, unchanged and still supported (everything `flash` does is these scripts):
+To run the default profile using the scripts directly:
 
 ```bash
 docker build -t qwen38-flash-dgx:v0.33 .      # official vLLM v0.33.0 image + the patches below
 scripts/download-weights.sh                   # nvidia/Qwen3.8-Flash-Next-NVFP4, ~124 GiB via Xet, resumable (one-time)
 scripts/prepare-hybrid.sh                     # recommended: fp8 side layers, +20% decode, same quality (~10 min, one-time)
-MODE=hybrid YARN=1 CTX=500000 scripts/serve.sh   # the recommended recipe; 500k context, ~3-4 min to load
+(set -a; . profiles/mtp-fast.env; scripts/serve.sh) # load the same profile as ./flash serve
 docker logs -f qwen38-flash                   # ready at "Application startup complete"
 scripts/smoke-test.sh                         # health, coherence, prefix-cache hit, determinism, tok/s
 ```
 
 OpenAI-compatible API on `http://localhost:18300/v1`, default model name `qwen3.8-flash-next`
-(configurable with `SERVED_MODEL_NAME`), tool calling and reasoning parsers on. Every default is the setting that scored best on our
-agentic tournament (see [How the defaults are chosen](#how-the-defaults-are-chosen-quality-first-speed-as-an-option));
-what you get on a GX10: ~34 tok/s single-stream decode, ~2,700–4,000 tok/s prefill (8k–32k prompts), a ~505–520k-token
-KV pool (larger numbers seen before 2026-09-25 were partly swap, see [#34](https://github.com/blazux/qwen3.8-Flash-DGX/pull/34)), prefix caching, deterministic greedy output, 500k tokens of context. The checkpoint is
-**NVIDIA's own NVFP4 quantization** since 2026-09-14 (it replaced RadixArk's after a 5-pass head-to-head:
-same or better quality, +15–22% KV, −8% single-stream decode — the whole story is in
-[Checkpoints](#checkpoints-nvidias-nvfp4-default-and-radixarks)); RadixArk's is one variable away,
-`MODEL=RadixArk/Qwen3.8-Flash-Next-NVFP4`, same recipe, same image. Want the checkpoint exactly as
-published? Drop `prepare-hybrid.sh` and `MODE=hybrid`. Want speed over the last percent of
-quality? `MTP=3`, and `MODE=hybrid-mtp` for more KV — both explained in the [options table](#how-the-defaults-are-chosen-quality-first-speed-as-an-option).
-Everything below is the long version: what was broken on GB10, what was fixed, and the numbers.
+(configurable with `SERVED_MODEL_NAME`), with tool calling and reasoning parsers enabled.
+The default checkpoint is [NVIDIA's NVFP4 build](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4)
+with hybrid FP8 side layers. See [Checkpoints](#checkpoints-nvidias-nvfp4-default-and-radixarks)
+for other supported checkpoints and their trade-offs.
 
 > **Independently reproduced** on a DGX Spark by
 > [@jschmied](https://github.com/jschmied) — see
@@ -65,11 +58,28 @@ Everything below is the long version: what was broken on GB10, what was fixed, a
 
 ## vLLM v0.33 upgrade
 
-The recipe builds on the official v0.33.0 image. Run `./flash setup` with
-your usual profile and recreate the container. Existing prepared hybrid
-checkpoints can be reused. Keep the previous container or image available for
-rollback. The optional `mtp-fast` profile pairs a quantized draft head with
-a larger prefill batch. See the [port notes and workload measurements](docs/VLLM-033.md).
+**`mtp-fast` is the default profile on vLLM 0.33.** Running `./flash serve`,
+`./flash serve default`, or `./flash serve mtp-fast` selects the same recipe.
+It uses an NVFP4 copy of the MTP proposal head, three speculative tokens, a 16k
+prefill batch, BF16 recurrent state, a 13 GiB FP8 KV cache, and a 500k context limit.
+
+| GX10 workload | vLLM 0.32 MTP3 | vLLM 0.33 `mtp-fast` | Change |
+| --- | ---: | ---: | ---: |
+| Cold prefill at 8k | 3,153 tok/s | 3,516 tok/s | +11.5% |
+| Cold prefill at 32k | 3,182 tok/s | 3,459 tok/s | +8.7% |
+| Cold prefill at 100k | 3,120 tok/s | 3,392 tok/s | +8.7% |
+| Sampled decode, one request | 35.1 tok/s | 42.6 tok/s | +21.3% |
+| Sampled decode, eight concurrent requests | 111.6 tok/s | 128.3 tok/s | +15.0% |
+
+These measurements used the same NVIDIA hybrid checkpoint on one GB10.
+The profile passed tool calling, Responses, vision and retrieval checks at
+263k and 499k tokens. The larger prefill batch uses more memory.
+Use `./flash serve BATCH_TOKENS=8192` to reduce the batch budget, or
+`./flash serve mtp-standard` for the previous MTP2 recipe on vLLM 0.33.
+See the [port notes and workload measurements](docs/VLLM-033.md).
+
+After updating the checkout, run `./flash setup`, then `./flash serve` to
+recreate the container. Existing prepared hybrid checkpoints can be reused.
 
 ### Previous vLLM v0.32 port (issues #58 and #59)
 
@@ -305,17 +315,11 @@ for quality and performance measurements.
 
 ## How the defaults are chosen: quality first, speed as an option
 
-The serving settings retained in `scripts/serve.sh` were selected using our **agentic
-tournament** (tool loops, long-context extraction, multi-step reasoning, hidden-test coding;
-17 scenarios when the recipe was built, 55 for the checkpoint decision; 3–5 repeats, temperature
-0.2), run on the GX10 with one variable changed at a time, on the same day. These
-measurements predate the v0.32 port; its narrower validation is documented above. A
-change that only buys tok/s or TTFT and costs even a point there ships as an **option**, off
-by default, with its measured cost next to it. Two runs of the same configuration differ by
-up to 2 points day to day, so anything inside that band is treated as equal and the faster
-one wins; anything below it stays an option.
+The [current default](#vllm-v033-upgrade) is based on the v0.33 measurements
+above. The table below records the earlier MTP2 recipe and the trade-offs
+measured when tuning it.
 
-| what | default | measured effect (GX10, hybrid, MTP=2, prefix caching, YaRN 500k) |
+| what | earlier setting | measured effect (GX10, hybrid, MTP=2, prefix caching, YaRN 500k) |
 | --- | --- | --- |
 | Checkpoint (`MODEL`) | **`nvidia/Qwen3.8-Flash-Next-NVFP4`** (since 2026-09-14) | vs RadixArk, 5 × 55 scenarios: 88.8% ± 1.0 vs 86.1% ± 1.9, runaway rate equal, needle and determinism equal; +15–22% KV pool, −8% single-stream decode |
 | Hybrid checkpoint (`MODE=hybrid`) | recommended, `nvfp4` as published is the default | +20% decode, +8% KV, same tournament score |
@@ -332,12 +336,8 @@ one wins; anything below it stays an option.
 | `concurrent` profile (`SEQS=16`, BF16 GDN state) | option | +21–94% aggregate throughput at 8–32 clients with the tested FP8 KV settings; second 55-scenario tournament pass 88.8% vs 88.9%, with one request timeout; [measurements below](#measured-concurrent-profile-pr-54) |
 | `--long-prefill-token-threshold` (via `EXTRA`) | option | keeps decoding clients responsive under concurrent prefills, at a TTFT cost |
 
-If your priority is raw throughput rather than the agent's reliability, the fast MTP profile is
-`MODE=hybrid MTP=3` (41 tok/s in the tournament against 38.5 for the default), and
-`MODE=hybrid-mtp` on top if you need the KV pool more than the last few percent of quality.
-The `dflash` profile reaches 57.0 tok/s against 45.2 tok/s for MTP=2 (+26%) on the tested single-request workload with matched settings. This is not a general speedup: gains depend on drafter acceptance, sampling and concurrency; see [DFlash profile](#dflash-profile).
-For parallel workloads, the `concurrent` profile raises the running-request cap to 16
-and uses BF16 recurrent state; see the [GX10 measurements](#measured-concurrent-profile-pr-54).
+DFlash performance varies with drafter acceptance, sampling and concurrency.
+See the [DFlash profile](#dflash-profile) for the workload breakdown.
 
 ## The `flash` command
 
@@ -358,14 +358,14 @@ Profiles (`profiles/*.env`, each a handful of `serve.sh` variables; copy one to 
 
 | profile | recipe | when |
 | --- | --- | --- |
-| `default` | hybrid, YaRN 500k, deterministic top-k, reduced draft vocabulary, prefix caching, MTP=2 | the recommended one: best tournament score (45/51) |
-| `speed` | default + `MTP=3` | +7% decode for about one tournament point |
-| `mtp-fast` | NVIDIA hybrid, MTP3 NVFP4 proposal head, 16k batch, 13 GiB FP8 KV, 500k context | higher cold prefill and sampled throughput on the measured GB10 workloads, with higher batch memory use. [v0.33 measurements](docs/VLLM-033.md#mtp-speed-profile) |
-| `dflash` | default + the DFlash2 draft model (incoai, 0.6B) instead of the MTP head (`DRAFT_MODEL`, `MTP=0`, `DRAFT_TOKENS=4`) | code, reasoning and tool-call workloads can benefit; +26% on the tested single-request workload. Sampled long-context prose can be slower. No quality degradation observed. Higher GPU memory use; [workload measurements below](#dflash-profile). |
-| `concurrent` | default + `SEQS=16`, `MAMBA_SSM_DTYPE=bfloat16`; uses the default CPUSET `5-9,15-19` | higher aggregate throughput with parallel clients; [measured with FP8 KV and an 8 GiB pool](#measured-concurrent-profile-pr-54) |
+| `default` / `mtp-fast` | NVIDIA hybrid, MTP3 NVFP4 proposal head, 16k batch, 13 GiB FP8 KV, 500k context | default on vLLM 0.33. [Performance and memory](#vllm-v033-upgrade) |
+| `mtp-standard` | NVIDIA hybrid, YaRN 500k, MTP2, reduced draft vocabulary | previous default recipe |
+| `speed` | `mtp-standard` with `MTP=3` | three speculative tokens with the reduced draft vocabulary |
+| `dflash` | `mtp-standard` + the DFlash2 draft model (incoai, 0.6B) instead of the MTP head (`DRAFT_MODEL`, `MTP=0`, `DRAFT_TOKENS=4`) | code, reasoning and tool-call workloads can benefit; +26% on the tested single-request workload. Sampled long-context prose can be slower. No quality degradation observed. Higher GPU memory use; [workload measurements below](#dflash-profile). |
+| `concurrent` | `mtp-standard` + `SEQS=16`, `MAMBA_SSM_DTYPE=bfloat16`; uses the default CPUSET `5-9,15-19` | higher aggregate throughput with parallel clients; [measured with FP8 KV and an 8 GiB pool](#measured-concurrent-profile-pr-54) |
 | `context` | `MODE=hybrid-mtp` (NVFP4 MTP draft experts) | +22% KV pool for concurrency or long contexts, decode unchanged |
 | `context-1m` | hybrid + `KV_DTYPE=fp8_e4m3`, 1M context | when you need 1M tokens in one request (small speed cost) |
-| `shared` | default + `--long-prefill-token-threshold 1024` | several clients at once: decoding stays responsive while others prefill, single-stream TTFT −17–36% |
+| `shared` | `mtp-standard` + `--long-prefill-token-threshold 1024` | several clients at once: decoding stays responsive while others prefill, single-stream TTFT −17–36% |
 | `published` | `MODE=nvfp4`, YaRN 500k | the checkpoint exactly as published, nothing to prepare; ~26 tok/s |
 | `native` | hybrid, 262k, no YaRN | if you never go past the native context |
 
@@ -856,7 +856,9 @@ mmap patch should apply; we have not booted one ourselves.
 | `CPUSET` | `5-9,15-19` | docker `--cpuset-cpus`: pin the container to the GB10's 10 Cortex-X5 performance cores. `CPUSET=` (empty) lets a newly created container use all 20 cores. The [measured concurrent profile](#measured-concurrent-profile-pr-54) uses this pinning; its independent speed contribution has not been established. |
 | `MAMBA_SSM_DTYPE` | | `--mamba-ssm-cache-dtype` for GDN recurrent state. Unset follows the checkpoint configuration: the tested NVIDIA checkpoint specifies `float32`. Explicit `bfloat16` halves bytes per recurrent-state element and changes its precision. Enabled by the `concurrent` profile; see [memory and quality measurements](#measured-concurrent-profile-pr-54). |
 | `GPU_MEM` | `0.80` | Fraction of the 128 GB pool for weights+KV. `0.85` buys ~2 GiB more KV, but after a day at `0.85` the box drifted into swap, and `0.875` got OOM-killed on a 300k-token prefill with MTP. The lower you set it, the more RAM the page cache has for the 48 GiB table — which is what your prefill speed depends on (below). Right after stopping another big container the first boot can fail with "13.5 GiB KV cache is needed, larger than available" — memory not yet released; the `unless-stopped` retry succeeds. |
-| `MTP` | `2` | Speculative tokens from the model's MTP head (`0` = off). `3` is +7% decode but cost a point at the tournament (44 vs 45/51), so it stays an option. |
+| `MTP` | `2` | Speculative tokens from the model's MTP head (`0` = off). The `mtp-fast` profile sets `3`. |
+| `MTP_DRAFT_QUANT` | | Quantize the MTP proposal head with `fp8` or `nvfp4`. Requires `DRAFT_VOCAB=0`. The `mtp-fast` profile sets `nvfp4`. |
+| `BATCH_TOKENS` | `8192` | Maximum scheduled tokens per engine step. The `mtp-fast` profile sets `16384`. |
 | `KV_DTYPE` | `auto` | `auto` = bf16 (recommended). `fp8_e4m3` = ~1.9× KV pool, 1M context on one box, at −10% decode / −30% prefill and a measurable quality cost — see [fp8 KV cache](docs/HOW-IT-WORKS.md#fp8-kv-cache-on-the-qsa-path-opt-in) before using it. |
 | `PREWARM` | `0` | `1` streams the 48 GiB table once at boot to warm the page cache — steadier first-request latency, ~10 s extra startup. |
 | `WORKERS` | `32` | Threads used for the mmap gather: every gather at the default `FAST_ROWS=0`; with `FAST_ROWS=512`, only gathers above 512 unique rows (decode-sized gathers then run inline). |

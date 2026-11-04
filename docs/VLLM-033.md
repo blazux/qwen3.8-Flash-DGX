@@ -7,8 +7,8 @@ incremental Chat tool arguments and the existing Responses event handling.
 Existing prepared hybrid checkpoints can be reused. [Upstream release notes](https://github.com/vllm-project/vllm/releases/tag/v0.33.0rc3)
 
 ```bash
-./flash setup default
-./flash serve default
+./flash setup
+./flash serve
 ```
 
 Use your existing profile name and overrides to recreate the container. Keep
@@ -41,6 +41,9 @@ quantizing the verifier head. This option requires Model Runner V2 and the full
 draft vocabulary. [Upstream proposal-head quantization](https://github.com/vllm-project/vllm/pull/59973)
 
 ## MTP speed profile
+
+`mtp-fast` is also selected by `./flash serve` and `./flash serve default`.
+Use `./flash serve mtp-standard` for the previous MTP2 recipe.
 
 ```bash
 ./flash setup mtp-fast

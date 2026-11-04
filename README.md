@@ -366,8 +366,8 @@ Profiles (`profiles/*.env`, each a handful of `serve.sh` variables; copy one to 
 | `concurrent` | `mtp-standard` + `SEQS=16`, `MAMBA_SSM_DTYPE=bfloat16`; uses the default CPUSET `5-9,15-19` | higher aggregate throughput with parallel clients; [measured with FP8 KV and an 8 GiB pool](#measured-concurrent-profile-pr-54) |
 | `context` | `MODE=hybrid-mtp` (NVFP4 MTP draft experts) | +22% KV pool for concurrency or long contexts, decode unchanged |
 | `context-1m` | hybrid + `KV_DTYPE=fp8_e4m3`, 1M context | when you need 1M tokens in one request (small speed cost) |
-| `dflash-1m` | `dflash` at 1M context (`KV_DTYPE=fp8_e4m3`, `MAMBA_SSM_DTYPE=bfloat16`, `GPU_MEM=0.864`) | DFlash2 drafting with 1M tokens in one request. The drafter holds ~10 GiB the MTP arm doesn't, so 1M needs the raised memory budget: a benchmark recipe, not a 24/7 one |
-| `mtp4-1m` | `context-1m` with `MTP=4`, `DRAFT_VOCAB=0`, `MAMBA_SSM_DTYPE=bfloat16`, `GPU_MEM=0.864` | the matched A/B baseline for `dflash-1m`: same K=4, same full draft vocabulary, same memory budget — it boots at 0.80 too, and is raised only so the arms differ in nothing but the drafter |
+| `dflash-1m` | DFlash2 K4, 1M context, BF16 recurrent state, 21 GiB fixed FP8 KV | optional profile for faster single-stream decoding |
+| `mtp4-1m` | MTP4, full draft vocabulary, same 1M context and cache budget | matched reference with more KV capacity at the same memory budget |
 | `shared` | `mtp-standard` + `--long-prefill-token-threshold 1024` | several clients at once: decoding stays responsive while others prefill, single-stream TTFT −17–36% |
 | `published` | `MODE=nvfp4`, YaRN 500k | the checkpoint exactly as published, nothing to prepare; ~26 tok/s |
 | `native` | hybrid, 262k, no YaRN | if you never go past the native context |
@@ -1157,15 +1157,17 @@ python3 bench/ab_report.py results/ab/*.jsonl --baseline mtp4-1m
 ./scripts/run-humaneval.sh think  # xhigh reasoning effort
 ```
 
-`scripts/ab-bench.sh` is the one to use for a drafter question (MTP vs DFlash2 above). Only one
-model fits on the box at a time, so it boots the arms in turn — alternating the order per block
-(AB BA) so drift lands on both sides — and it holds both arms to the same recipe everywhere else:
-the same seeded prompt stream, `PROM_MULTIPROC=1` so `vllm:spec_decode_*` reaches `/metrics` and
-the tok/s comes with the acceptance rate behind it, `DRAFT_VOCAB=0` on the MTP arm because DFlash2
-cannot use the pruned vocabulary, and the greedy outputs hashed per rep, since a lossless draft
-must not change a single token. `bench/ab_report.py` exits non-zero when the two boots differ in
-any engine argument apart from `--speculative-config`, or when the KV pool came out under the
-advertised context — the two ways these comparisons usually lie.
+The A/B harness temporarily stops the selected serving container and runs the
+two arms in a separate container. It restarts the original container and waits
+for readiness at exit. Run it during a maintenance window. `--keep` leaves the
+final arm running after a successful run.
+
+On one GX10 with vLLM 0.33 and the NVIDIA hybrid checkpoint, both 1M profiles
+passed retrieval at 990k tokens. With the same 21 GiB KV budget, MTP4 and
+DFlash K4 held 1.52M and 1.11M KV tokens respectively. DFlash K4 delivered
+27% higher greedy solo decode throughput and 9% higher sampled solo throughput
+at temperature 0.7. At eight concurrent sampled requests, the gain was 2%.
+These are workload-specific measurements from one matched pass.
 
 Everything is env-driven (`GB10_BASE_URL`, `GB10_API_KEY`, `GB10_MODEL` — see
 `bench/common.py`) and the scripts are self-locating, so nothing is path-dependent.

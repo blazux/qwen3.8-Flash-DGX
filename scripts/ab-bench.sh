@@ -21,8 +21,8 @@
 # `docker inspect`, KV pool from the boot log, host state). Compare with bench/ab_report.py,
 # which fails the run if the two arms differ in anything but --speculative-config.
 #
-# This REPLACES the running container. The profile that was serving when you started is
-# relaunched at the end unless you pass --keep.
+# This stops the running container and uses a separate name for the benchmark.
+# The original container is restarted and checked at exit unless --keep succeeds.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -60,18 +60,9 @@ read -r -a ARM_LIST <<< "$ARMS"
 [ "${#ARM_LIST[@]}" -ge 2 ] || { echo "!! --arms needs at least two profiles"; exit 2; }
 mkdir -p "$OUT_DIR"
 
-was_profile="$(cat "${XDG_STATE_HOME:-$HOME/.local/state}/qwen38-flash/profile.$NAME" 2>/dev/null || true)"
 echo ">> A/B: ${ARM_LIST[*]}   blocks=$BLOCKS  suite=$SUITE  seed=$SEED  -> $OUT_DIR"
 if [ "$DRYRUN" = 0 ]; then
-  if [ "$KEEP" = 1 ]; then
-    echo "   this replaces the running container, and the last arm stays up (--keep)"
-  elif [ -n "$was_profile" ]; then
-    echo "   this replaces the running container; '$was_profile' goes back up at the end"
-  else
-    echo "   this replaces the running container; nothing was serving, so no restore is queued"
-  fi
-  echo "   ctrl-c is safe at any point — the runs already written stay usable."
-  sleep 3
+  echo "   this temporarily stops $NAME while the benchmark uses port $PORT"
 fi
 
 # Each arm must be servable before boots start: a missing draft model or an image without patch
@@ -226,6 +217,45 @@ if not shown and not cap:            # nothing matched: at least show where it s
 PY
 }
 
+if [ "$DRYRUN" = 0 ]; then
+  ORIGINAL_NAME="$NAME"
+  ORIGINAL_ID="$(docker container inspect -f '{{.Id}}' "$ORIGINAL_NAME" 2>/dev/null || true)"
+  ORIGINAL_RUNNING=0
+  if [ -n "$ORIGINAL_ID" ]; then
+    ORIGINAL_RUNNING="$(docker container inspect -f '{{.State.Running}}' "$ORIGINAL_ID")"
+  fi
+  NAME="$ORIGINAL_NAME-ab-$$"
+  if docker container inspect "$NAME" >/dev/null 2>&1; then
+    echo "!! benchmark container $NAME already exists" >&2
+    exit 1
+  fi
+  restore() {
+    local rc=$?
+    trap - EXIT
+    trap '' INT TERM
+    if [ "$rc" = 0 ] && [ "$KEEP" = 1 ]; then
+      echo ">> leaving $NAME running (--keep)"
+      exit 0
+    fi
+    if docker container inspect "$NAME" >/dev/null 2>&1; then
+      docker rm -f "$NAME" >/dev/null || rc=1
+    fi
+    if [ "$ORIGINAL_RUNNING" = true ]; then
+      echo ">> restoring $ORIGINAL_NAME"
+      docker start "$ORIGINAL_ID" >/dev/null &&
+        NAME="$ORIGINAL_NAME" "$FLASH" wait || rc=1
+    fi
+    exit "$rc"
+  }
+  trap restore EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  if [ "$ORIGINAL_RUNNING" = true ]; then
+    docker stop -t 30 "$ORIGINAL_ID" >/dev/null
+  fi
+  export GB10_BASE_URL="http://127.0.0.1:$PORT/v1"
+fi
+
 FAILED=()
 for block in $(seq 1 "$BLOCKS"); do
   # ABBA: block 1 runs the arms in order, block 2 reversed, ... so no arm always boots after a
@@ -268,11 +298,6 @@ echo
 if [ "$DRYRUN" = 1 ]; then
   echo ">> dry run only — nothing was booted or measured"
   exit 0
-fi
-if [ "$KEEP" = 0 ] && [ -n "$was_profile" ] && [ "$was_profile" != "${ARM_LIST[0]}" ]; then
-  echo ">> bringing '$was_profile' back up (was serving before this run)"
-  NAME="$NAME" PORT="$PORT" "$FLASH" serve "$was_profile" >/dev/null 2>&1 || \
-    echo "   !! could not relaunch it — run: ./flash serve $was_profile"
 fi
 [ "${#FAILED[@]}" -gt 0 ] && echo "!! incomplete: ${FAILED[*]}"
 echo ">> compare with:"

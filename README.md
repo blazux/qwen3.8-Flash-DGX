@@ -366,7 +366,7 @@ Profiles (`profiles/*.env`, each a handful of `serve.sh` variables; copy one to 
 | `concurrent` | `mtp-standard` + `SEQS=16`, `MAMBA_SSM_DTYPE=bfloat16`; uses the default CPUSET `5-9,15-19` | higher aggregate throughput with parallel clients; [measured with FP8 KV and an 8 GiB pool](#measured-concurrent-profile-pr-54) |
 | `context` | `MODE=hybrid-mtp` (NVFP4 MTP draft experts) | +22% KV pool for concurrency or long contexts, decode unchanged |
 | `context-1m` | hybrid + `KV_DTYPE=fp8_e4m3`, 1M context | when you need 1M tokens in one request (small speed cost) |
-| `dflash-1m` | DFlash2 K4, 1M context, BF16 recurrent state, 21 GiB fixed FP8 KV | optional profile for faster single-stream decoding |
+| `dflash-1m` | DFlash2 K4, 1M context, BF16 recurrent state, 21 GiB fixed FP8 KV | faster single-stream decoding. [Compare 1M profiles](#choosing-a-1m-context-profile) |
 | `mtp4-1m` | MTP4, full draft vocabulary, same 1M context and cache budget | matched reference with more KV capacity at the same memory budget |
 | `shared` | `mtp-standard` + `--long-prefill-token-threshold 1024` | several clients at once: decoding stays responsive while others prefill, single-stream TTFT −17–36% |
 | `published` | `MODE=nvfp4`, YaRN 500k | the checkpoint exactly as published, nothing to prepare; ~26 tok/s |
@@ -375,6 +375,36 @@ Profiles (`profiles/*.env`, each a handful of `serve.sh` variables; copy one to 
 Precedence: a variable already in your environment beats the profile (`PORT=18301 ./flash serve`
 works like the plain scripts), and `KEY=VALUE` arguments beat both. Container name and port default
 to `qwen38-flash` and `18300`, like `serve.sh`.
+
+### Choosing a 1M-context profile
+
+Choose `dflash-1m` for faster single-stream generation, especially greedy
+decoding. Choose `mtp4-1m` when KV capacity matters more, for example when
+other requests share the server with a long prompt. For workloads within
+500k context, start with `mtp-fast`, the default profile.
+
+```bash
+./flash setup dflash-1m
+./flash serve dflash-1m
+# Or serve mtp4-1m on the same port after stopping the current server.
+```
+
+| GX10 workload | `mtp4-1m` | `dflash-1m` | DFlash change |
+| --- | ---: | ---: | ---: |
+| KV capacity | 1.52M tokens | 1.11M tokens | −27% |
+| Cold prefill, 8k | 3,132 tok/s | 2,751 tok/s | −12% |
+| Cold prefill, 512k | 2,722 tok/s | 2,779 tok/s | +2% |
+| Cold prefill, 900k | 2,385 tok/s | 2,438 tok/s | +2% |
+| Greedy decode, one request | 36.6 tok/s | 46.4 tok/s | +27% |
+| Sampled decode, one request, T=0.7 | 37.0 tok/s | 40.2 tok/s | +9% |
+| Sampled throughput, eight requests, T=0.7 | 109.8 tok/s | 112.2 tok/s | +2% |
+
+Both profiles passed retrieval at 990k tokens and a follow-up generation.
+The matched run used vLLM 0.33, the NVIDIA hybrid checkpoint and 21 GiB of
+fixed FP8 KV on one GX10. Prefill rates are medians of two cold runs per
+size, so the small differences at 512k and 900k are indicative. Capacity
+refers to the shared KV pool. The per-request limit is 1M tokens.
+[PR #66](https://github.com/blazux/qwen3.8-Flash-DGX/pull/66)
 
 ### DFlash profile
 
@@ -1160,14 +1190,7 @@ python3 bench/ab_report.py results/ab/*.jsonl --baseline mtp4-1m
 The A/B harness temporarily stops the selected serving container and runs the
 two arms in a separate container. It restarts the original container and waits
 for readiness at exit. Run it during a maintenance window. `--keep` leaves the
-final arm running after a successful run.
-
-On one GX10 with vLLM 0.33 and the NVIDIA hybrid checkpoint, both 1M profiles
-passed retrieval at 990k tokens. With the same 21 GiB KV budget, MTP4 and
-DFlash K4 held 1.52M and 1.11M KV tokens respectively. DFlash K4 delivered
-27% higher greedy solo decode throughput and 9% higher sampled solo throughput
-at temperature 0.7. At eight concurrent sampled requests, the gain was 2%.
-These are workload-specific measurements from one matched pass.
+final arm running after a successful run. See the [1M profile comparison](#choosing-a-1m-context-profile) for results.
 
 Everything is env-driven (`GB10_BASE_URL`, `GB10_API_KEY`, `GB10_MODEL` — see
 `bench/common.py`) and the scripts are self-locating, so nothing is path-dependent.

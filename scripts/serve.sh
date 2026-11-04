@@ -53,6 +53,8 @@
 #   GPU_MEM=0.80      fraction of the 128 GB pool for weights+KV. 0.85 buys ~2 GiB of KV but the
 #                     box drifted into swap after a day at it; 0.875 got OOM-killed on a 300k prefill
 #   MTP=2             speculative tokens from the model's MTP head (0 = off)
+#   MTP_DRAFT_QUANT=   fp8 or nvfp4 for the MTP draft head on V2 (requires DRAFT_VOCAB=0)
+#   BATCH_TOKENS=8192 maximum scheduled tokens per engine step
 #   DRAFT_MODEL=      a HF draft model (org/name) for vLLM's dflash speculative decoding:
 #                     replaces the MTP head with a block-diffusion draft model (incoai's
 #                     DFlash2, 0.6B, ~1.2 GiB — scripts/download-draft.sh). MTP=0 is implied.
@@ -70,11 +72,11 @@
 #                     which this script recreates every time, so they are rebuilt on every boot
 #                     (~37 s of startup, see README). A bare name becomes docker volumes, an
 #                     absolute path binds dirs
-#   IMAGE=qwen38-flash-dgx:v0.32   MODEL=nvidia/Qwen3.8-Flash-Next-NVFP4   (RadixArk/Qwen3.8-Flash-Next-NVFP4 still supported: MODEL=...)
+#   IMAGE=qwen38-flash-dgx:v0.33   MODEL=nvidia/Qwen3.8-Flash-Next-NVFP4   (RadixArk/Qwen3.8-Flash-Next-NVFP4 still supported: MODEL=...)
 set -euo pipefail
 
 NAME="${NAME:-qwen38-flash}"
-IMAGE="${IMAGE:-qwen38-flash-dgx:v0.32}"
+IMAGE="${IMAGE:-qwen38-flash-dgx:v0.33}"
 MODEL="${MODEL:-nvidia/Qwen3.8-Flash-Next-NVFP4}"   # default since 2026-09-14; see README "Checkpoints"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-qwen3.8-flash-next}"
 HF_CACHE="${HF_CACHE:-$HOME/.cache/huggingface}"
@@ -97,6 +99,9 @@ CPUSET="${CPUSET-5-9,15-19}"
 MAMBA_SSM_DTYPE="${MAMBA_SSM_DTYPE:-}"
 GPU_MEM="${GPU_MEM:-0.80}"
 MTP="${MTP:-2}"
+MTP_DRAFT_QUANT="${MTP_DRAFT_QUANT:-}"
+BATCH_TOKENS="${BATCH_TOKENS:-8192}"
+case "$BATCH_TOKENS" in 0*|*[!0-9]*) echo "!! BATCH_TOKENS must be a positive integer"; exit 1 ;; esac
 DRAFT_MODEL="${DRAFT_MODEL:-}"
 DRAFT_TOKENS="${DRAFT_TOKENS:-4}"
 KV_DTYPE="${KV_DTYPE:-auto}"
@@ -213,7 +218,7 @@ fi
 # Older preview/v0.29 builds have different op names and patches.
 BASE="$(docker image inspect -f '{{index .Config.Labels "qwen38.base"}}' "$IMAGE" 2>/dev/null || true)"
 case "$BASE" in
-  v0.32) ;;
+  v0.33) ;;
   *) echo "!! $IMAGE has unsupported base '${BASE:-missing or unlabeled}'; rebuild this recipe with ./flash setup"; exit 1 ;;
 esac
 
@@ -251,6 +256,19 @@ if [ "$YARN" != 0 ]; then OVR_ARGS=(--hf-overrides "$YARN_OVR"); ALLOW_LONG=1; f
 # No quality degradation observed in validation; DFlash uses more GPU memory.
 SPEC=()
 DRAFT_ENV=()
+MTP_QUANT_JSON=""
+case "$MTP_DRAFT_QUANT" in
+  "") ;;
+  fp8|nvfp4)
+    if [ "$MTP" = 0 ] || [ -n "$DRAFT_MODEL" ] || [ "$DRAFT_VOCAB" != 0 ]; then
+      echo "!! MTP_DRAFT_QUANT requires MTP enabled, DRAFT_VOCAB=0 and no DRAFT_MODEL"
+      exit 1
+    fi
+    MTP_QUANT_JSON=",\"draft_lm_head_quantization\":\"$MTP_DRAFT_QUANT\""
+    DRAFT_ENV=(-e VLLM_USE_V2_MODEL_RUNNER=1)
+    ;;
+  *) echo "!! MTP_DRAFT_QUANT must be fp8 or nvfp4"; exit 1 ;;
+esac
 if [ -n "$DRAFT_MODEL" ]; then
   DRAFT_ENV=(-e VLLM_USE_V2_MODEL_RUNNER=1)  # init_speculator: dflash is a V2-runner path
   DRAFT_HOST=""
@@ -273,9 +291,9 @@ if [ -n "$DRAFT_MODEL" ]; then
   echo ">> DRAFT_MODEL $DRAFT_MODEL replaces the MTP head (MTP=$MTP ignored); speculative config: method=dflash, $DRAFT_TOKENS draft tokens"
 elif [ "$MTP" != 0 ]; then
   if [ "$YARN" != 0 ]; then
-    SPEC=(--speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":${MTP},\"max_model_len\":${CTX}}")
+    SPEC=(--speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":${MTP},\"max_model_len\":${CTX}${MTP_QUANT_JSON}}")
   else
-    SPEC=(--speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":${MTP}}")
+    SPEC=(--speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":${MTP}${MTP_QUANT_JSON}}")
   fi
 fi
 
@@ -408,7 +426,7 @@ docker run -d --name "$NAME" --restart unless-stopped \
   "$SNAP_IN" --served-model-name "$SERVED_MODEL_NAME" \
     --host 0.0.0.0 --port 8000 --load-format safetensors \
     --max-model-len "$CTX" --max-num-seqs "$SEQS" --gpu-memory-utilization "$GPU_MEM" \
-    $PC_ARG --enable-prompt-tokens-details --enable-chunked-prefill --max-num-batched-tokens 8192 \
+    $PC_ARG --enable-prompt-tokens-details --enable-chunked-prefill --max-num-batched-tokens "$BATCH_TOKENS" \
     $CC \
     --no-enable-flashinfer-autotune \
     --kv-cache-dtype "$KV_DTYPE" ${KV_CACHE_MEM:+--kv-cache-memory-bytes "$KV_CACHE_MEM"} \

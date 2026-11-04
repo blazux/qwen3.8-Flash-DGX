@@ -1,4 +1,4 @@
-# Qwen3.8-Flash-Next on a DGX Spark — the official vLLM v0.32.0 image plus these patches:
+# Qwen3.8-Flash-Next on a DGX Spark — the official vLLM v0.33.0 image plus these patches:
 #   1 PLE mmap, 2 GB10 FLA fixes, 4 prefix-caching block_size fix, 5 exact top-k, 6 hybrid mode,
 #   8 deterministic top-k kernel, 10 reduced draft vocabulary, 12 Qwen tool preamble fix,
 #   13 quoted Qwen tool markers stay text, 14 MoE weight-load clone (#33), 15-18 the rest of weight
@@ -9,9 +9,9 @@
 # Upstream now: 3 (vllm#50729), 7 (vllm#55557), 9 (vllm#52775),
 # 11 (vllm#55513), 16 (vllm#58720). Older bases remain in git history.
 #
-#   docker build -t qwen38-flash-dgx:v0.32 .
-FROM vllm/vllm-openai:v0.32.0
-LABEL qwen38.base=v0.32
+#   docker build -t qwen38-flash-dgx:v0.33 .
+FROM vllm/vllm-openai:v0.33.0@sha256:d825baf9ce4b1b6bfc5ecc7b79880c7e6748c65a72d697ce3d47607aafa84c6e
+LABEL qwen38.base=v0.33
 ARG SP=/usr/local/lib/python3.12/dist-packages
 ARG PKG=${SP}/vllm/models/qwen4_exp/nvidia
 ARG PLE=${PKG}/ngram_embedding.py
@@ -56,7 +56,7 @@ RUN cp ${MO} ${MO}.orig \
 # The earlier local implementation followed @Nanetnounou's original (issue #6).
 # Use upstream support now, with assertions against accidental base drift.
 # Native since v0.31 (vllm#55557); do not apply the older local patch.
-RUN grep -q 'IS_FP8=is_fp8' ${PKG}/ops/qsa.py && grep -q '"fp8_e4m3"' ${QSA}
+RUN grep -q 'is_fp8 = k_cache.dtype' ${PKG}/ops/qsa.py && grep -q '"fp8_e4m3"' ${QSA}
 
 # --- 8. Deterministic persistent_topk kernel (@jschmied, vllm#55122), built with the image's nvcc ---
 # v0.30 changed the stock kernel (vllm#54110 low-smem fallback, vllm#56346 sampled filtering): whether GB10
@@ -79,27 +79,6 @@ RUN cd /opt/llm/kernel-det/src && DET_BUILD_DIR=/opt/llm/kernel-det/build DET_AR
 COPY src/patch_mtp_draft_vocab.py /tmp/patch_mtp_draft_vocab.py
 COPY src/draft_vocab_65536.npy /opt/llm/draft_vocab_65536.npy
 RUN python3 /tmp/patch_mtp_draft_vocab.py ${PKG}/mtp.py && rm /tmp/patch_mtp_draft_vocab.py
-
-# --- 12. Preserve quoted/malformed Qwen tool markers in reasoning and content ---
-# Confirm a tool preamble before switching output channels.
-COPY src/patches/qwen-tool-preamble.patch /tmp/qwen-tool-preamble.patch
-RUN cd ${SP} && patch --batch --forward --fuzz=0 -p1 < /tmp/qwen-tool-preamble.patch \
- && rm /tmp/qwen-tool-preamble.patch
-
-# --- 13. Quoted Qwen tool markers the model is documenting, not calling ---
-# A marker inside a fenced code block, or a wrapper-less <function= header mid-line,
-# stays text and opens no tool call. Needs 12 applied first.
-COPY src/patches/qwen-tool-marker-guard.patch /tmp/qwen-tool-marker-guard.patch
-RUN cd ${SP} && patch --batch --forward --fuzz=0 -p1 < /tmp/qwen-tool-marker-guard.patch \
- && rm /tmp/qwen-tool-marker-guard.patch
-
-# --- 19. Qwen token identity and truthful Responses terminal events (issue #31) ---
-# Ported from Chaos2522's source bundle to v0.32; requires patches 12 and 13.
-# No sampling/weight/KV changes. Responses buffers complete XML arguments;
-# Chat Completions retains its incremental argument streaming.
-COPY src/patches/qwen-safe-output.patch /tmp/qwen-safe-output.patch
-RUN cd ${SP} && patch --batch --forward --fuzz=0 -p1 < /tmp/qwen-safe-output.patch \
- && rm /tmp/qwen-safe-output.patch
 
 # --- 14. MoE weight loading: clone the mmap view before the H2D copy (VLLM_LOAD_CLONE=0 disables) ---
 # PR #33 (@Willian-Zhang): the two call sites in routed_experts.py; byte-identical weights.
@@ -125,14 +104,6 @@ COPY src/patches/qwen-mtp-aux-output.patch /tmp/qwen-mtp-aux-output.patch
 RUN cd ${SP} && patch --batch --forward --fuzz=0 -p1 < /tmp/qwen-mtp-aux-output.patch \
  && rm /tmp/qwen-mtp-aux-output.patch
 
-# --- 21. Repair accidental Qwen arguments wrappers using the offered schema (issue #31) ---
-# Ported from Chaos2522's schema2 bundle; requires patch 19 including the #56 follow-up.
-# Keep Chat compatibility and incremental normal arguments; validate Responses before emission.
-COPY src/patches/qwen-tool-argument-schema.patch /tmp/qwen-tool-argument-schema.patch
-RUN cd ${SP} && patch --batch --forward --fuzz=0 -p1 < /tmp/qwen-tool-argument-schema.patch \
- && python3 -c "import ast, jsonschema, referencing; ast.parse(open('${SP}/vllm/parser/engine/argument_validation.py').read())" \
- && rm /tmp/qwen-tool-argument-schema.patch
-
 # --- 22. M-RoPE cache covers served positions, including the MTP draft path (issue #60) ---
 # Adapted from wtogami's vllm#62409; preserve the original YaRN frequency base and cache rows.
 COPY src/patches/qwen-mrope-cache-window.patch /tmp/qwen-mrope-cache-window.patch
@@ -150,3 +121,10 @@ RUN python3 /tmp/patch_dflash_qwen4exp.py ${SP} && rm /tmp/patch_dflash_qwen4exp
 
 # Advertise DFlash only after patch 23 has applied successfully (issue #64).
 LABEL qwen38.dflash=1
+
+# --- 12, 13, 19, 21. Qwen tool parsing, token identity and Responses events ---
+# Rebase these fixes together on the upstream 0.33 incremental parser.
+COPY src/patches/qwen-parser-v033.patch /tmp/qwen-parser-v033.patch
+RUN cd ${SP} && patch --batch --forward --fuzz=0 -p1 < /tmp/qwen-parser-v033.patch \
+ && python3 -c "import ast, jsonschema, referencing; ast.parse(open('${SP}/vllm/parser/engine/argument_validation.py').read())" \
+ && rm /tmp/qwen-parser-v033.patch

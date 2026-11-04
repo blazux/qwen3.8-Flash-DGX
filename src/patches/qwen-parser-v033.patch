@@ -1,0 +1,1434 @@
+--- a/vllm/entrypoints/openai/responses/protocol.py
++++ b/vllm/entrypoints/openai/responses/protocol.py
+@@ -40,6 +40,9 @@
+     ResponseCompletedEvent as OpenAIResponseCompletedEvent,
+ )
+ from openai.types.responses import ResponseCreatedEvent as OpenAIResponseCreatedEvent
++from openai.types.responses import ResponseFailedEvent as OpenAIResponseFailedEvent
++from openai.types.responses.response_error import ResponseError
++from openai.types.responses.response_error_event import ResponseErrorEvent
+ from openai.types.responses import (
+     ResponseIncompleteEvent as OpenAIResponseIncompleteEvent,
+ )
+@@ -870,7 +873,7 @@
+ class ResponsesResponse(OpenAIBaseModel):
+     id: str = Field(default_factory=lambda: f"resp_{random_uuid()}")
+     created_at: int = Field(default_factory=lambda: int(time.time()))
+-    # error: Optional[ResponseError] = None
++    error: ResponseError | None = None
+     incomplete_details: IncompleteDetails | None = None
+     instructions: str | None = None
+     metadata: Metadata | None = None
+@@ -1037,6 +1040,10 @@
+     response: ResponsesResponse  # type: ignore[override]
+ 
+ 
++class ResponseFailedEvent(OpenAIResponseFailedEvent):
++    response: ResponsesResponse  # type: ignore[override]
++
++
+ class ResponseIncompleteEvent(OpenAIResponseIncompleteEvent):
+     response: ResponsesResponse  # type: ignore[override]
+ 
+@@ -1050,7 +1057,9 @@
+ 
+ 
+ StreamingResponsesResponse: TypeAlias = (
+-    ResponseCreatedEvent
++    ResponseErrorEvent
++    | ResponseFailedEvent
++    | ResponseCreatedEvent
+     | ResponseInProgressEvent
+     | ResponseCompletedEvent
+     | ResponseIncompleteEvent
+--- a/vllm/entrypoints/openai/responses/serving.py
++++ b/vllm/entrypoints/openai/responses/serving.py
+@@ -19,6 +19,7 @@
+ )
+ from openai.types.responses.response_output_text import Logprob, LogprobTopLogprob
+ from pydantic import TypeAdapter
++from openai.types.responses.response_error_event import ResponseErrorEvent
+ 
+ from vllm import envs
+ from vllm.config.utils import replace
+@@ -44,6 +45,8 @@
+     InputTokensDetails,
+     OutputTokensDetails,
+     ResponseCompletedEvent,
++    ResponseFailedEvent,
++    ResponseError,
+     ResponseCreatedEvent,
+     ResponseIncompleteEvent,
+     ResponseInProgressEvent,
+@@ -865,12 +868,15 @@
+             if streamed_items is not None:
+                 output = streamed_items
+             else:
+-                output = self._make_response_output_items(
+-                    request,
+-                    final_output,
+-                    tokenizer,
+-                    parser=context.response_parser,
+-                )
++                try:
++                    output = self._make_response_output_items(
++                        request,
++                        final_output,
++                        tokenizer,
++                        parser=context.response_parser,
++                    )
++                except GenerationError as e:
++                    return self.create_error_response(str(e), status_code=e.status_code)
+ 
+             if request.enable_response_messages:
+                 input_messages = context.input_messages
+@@ -1053,6 +1059,18 @@
+                 enable_auto_tools=self.enable_auto_tools,
+                 model_output_token_ids=final_output.token_ids,
+             )
++            if getattr(parser, "has_invalid_tool_arguments", False):
++                raise GenerationError("Model generated arguments that violate the offered tool schema")
++            if getattr(parser, "has_rejected_tool_calls", False):
++                raise GenerationError("Model generated a tool call absent from offered tools")
++            if (
++                final_output.finish_reason == "stop"
++                and not (content or "").strip()
++                and not tool_calls
++            ):
++                raise GenerationError(
++                    "Model stopped without delivering a visible answer or function call"
++                )
+             if not request.include_reasoning:
+                 reasoning = None
+                 logprobs = None
+@@ -1066,6 +1084,8 @@
+             )
+ 
+         # Fallback when no parser is configured
++        if final_output.finish_reason == "stop" and not (final_output.text or "").strip():
++            raise GenerationError("Model stopped without delivering a visible answer or function call")
+         return [
+             ResponseOutputMessage(
+                 id=f"msg_{random_uuid()}",
+@@ -1143,8 +1163,7 @@
+                 event = event_deque[current_index]
+                 yield event
+                 if getattr(event, "type", "unknown") in (
+-                    "response.completed",
+-                    "response.incomplete",
++                    "response.completed", "response.incomplete", "response.failed"
+                 ):
+                     return
+                 current_index += 1
+@@ -1210,6 +1229,26 @@
+             status_code=HTTPStatus.NOT_FOUND,
+             param="response_id",
+         )
++
++    def _make_failed_response_event(
++        self, request: ResponsesRequest, sampling_params: SamplingParams,
++        model_name: str, created_time: int, message: str,
++    ) -> ResponseFailedEvent:
++        response = ResponsesResponse.from_request(
++            request, sampling_params, model_name=model_name,
++            created_time=created_time, output=[], status="failed", usage=None,
++        )
++        response.error = ResponseError(code="server_error", message=message)
++        return ResponseFailedEvent(
++            type="response.failed", response=response, sequence_number=-1,
++        )
++
++    def _convert_generation_error_to_streaming_response(self, e: GenerationError) -> str:
++        """Responses streams require an error event, not the Chat error envelope."""
++        return ResponseErrorEvent(
++            type="error", code="server_error", message=str(e),
++            param=None, sequence_number=-1,
++        ).model_dump_json()
+ 
+     async def _process_simple_streaming_events(
+         self,
+@@ -1243,6 +1282,8 @@
+                 top_logprobs=request.top_logprobs,
+             )
+ 
++        has_nonreasoning_output = False
++
+         finish_reason: str | None = None
+         async for ctx in result_generator:
+             assert isinstance(ctx, SimpleContext)
+@@ -1266,6 +1307,18 @@
+             else:
+                 delta_message = DeltaMessage(content=output.text)
+ 
++            if getattr(ctx.response_parser, "has_invalid_tool_arguments", False):
++                raise GenerationError("Model generated arguments that violate the offered tool schema")
++            if getattr(ctx.response_parser, "has_rejected_tool_calls", False):
++                raise GenerationError("Model generated a tool call absent from offered tools")
++            has_nonreasoning_output = has_nonreasoning_output or bool(
++                delta_message
++                and ((delta_message.content or "").strip() or delta_message.tool_calls)
++            )
++            if output.finish_reason == "stop" and not has_nonreasoning_output:
++                raise GenerationError(
++                    "Model stopped without delivering a visible answer or function call"
++                )
+             if not delta_message:
+                 continue
+             delta_message = maybe_filter_parallel_tool_calls(delta_message, request)
+@@ -1416,9 +1469,10 @@
+                 ):
+                     yield event_data
+             except GenerationError as e:
+-                error_json = self._convert_generation_error_to_streaming_response(e)
+                 yield _increment_sequence_number_and_return(
+-                    TypeAdapter(StreamingResponsesResponse).validate_json(error_json)
++                    self._make_failed_response_event(
++                        request, sampling_params, model_name, created_time, str(e),
++                    )
+                 )
+                 return
+ 
+@@ -1438,20 +1492,34 @@
+                 request_metadata,
+                 created_time=created_time,
+             )
+-            terminal_event: StreamingResponsesResponse
+-            if (
+-                isinstance(final_response, ResponsesResponse)
+-                and final_response.status == "incomplete"
+-            ):
+-                terminal_event = ResponseIncompleteEvent(
+-                    type="response.incomplete",
+-                    sequence_number=-1,
+-                    response=final_response,
+-                )
+-            else:
+-                terminal_event = ResponseCompletedEvent(
+-                    type="response.completed",
+-                    sequence_number=-1,
+-                    response=final_response,
+-                )
++            if isinstance(final_response, ErrorResponse):
++                yield _increment_sequence_number_and_return(
++                    self._make_failed_response_event(
++                        request, sampling_params, model_name, created_time,
++                        "Model tool call could not be delivered",
++                    )
++                )
++                return
++            # The terminal event is part of the wire contract: clients must
++            # not interpret an incomplete response body as successful completion.
++            terminal_events = {
++                "completed": (ResponseCompletedEvent, "response.completed"),
++                "incomplete": (ResponseIncompleteEvent, "response.incomplete"),
++                "failed": (ResponseFailedEvent, "response.failed"),
++            }
++            terminal = terminal_events.get(final_response.status)
++            if terminal is None:
++                yield _increment_sequence_number_and_return(
++                    self._make_failed_response_event(
++                        request, sampling_params, model_name, created_time,
++                        "Model response did not reach a supported terminal status",
++                    )
++                )
++                return
++            event_class, event_type = terminal
++            terminal_event = event_class(
++                type=event_type,
++                sequence_number=-1,
++                response=final_response,
++            )
+             yield _increment_sequence_number_and_return(terminal_event)
+--- a/vllm/parser/abstract_parser.py
++++ b/vllm/parser/abstract_parser.py
+@@ -354,6 +354,17 @@
+     values (no reasoning extraction, no tool calls).
+     """
+ 
++    @property
++    def has_unresolved_reasoning_tool_candidate(self) -> bool:
++        """Expose only the reasoning parser's unresolved-marker diagnosis."""
++        return bool(getattr(self._reasoning_parser, "has_unresolved_reasoning_tool_candidate", False))
++
++    @property
++    def has_rejected_tool_calls(self) -> bool:
++        """Expose tool rejection through the composed serving-layer parser."""
++        return any(bool(getattr(parser, "has_rejected_tool_calls", False))
++                   for parser in (self._tool_parser, self._reasoning_parser))
++
+     def extract_reasoning(
+         self,
+         model_output: str,
+@@ -362,6 +373,11 @@
+         if self._reasoning_parser is None:
+             return None, model_output
+         return self._reasoning_parser.extract_reasoning(model_output, request)
++
++    @property
++    def has_invalid_tool_arguments(self):
++        return any(bool(getattr(parser, "has_invalid_tool_arguments", False))
++                   for parser in (self._tool_parser, self._reasoning_parser))
+ 
+     def _get_function_name(
+         self, request: ChatCompletionRequest | ResponsesRequest
+@@ -838,6 +854,56 @@
+         self._append_unstreamed_tool_args(delta_message)
+         return delta_message
+ 
++    def _parse_engine_token_ids(
++        self,
++        model_output: str,
++        request: ChatCompletionRequest | ResponsesRequest,
++        model_output_token_ids: Sequence[int],
++    ) -> tuple[str | None, str | None, list[FunctionCall] | None]:
++        """Replay the same ID-aware parser path used for streaming.
++
++        Token IDs distinguish actual protocol terminals from ordinary BPE
++        spellings of the same bytes. Never retokenize the decoded text.
++        """
++        kwargs = dict(getattr(self._reasoning_parser, "_parser_engine_kwargs", {}))
++        replay = type(self)(
++            self.model_tokenizer, tools=getattr(request, "tools", None), **kwargs
++        )
++        replay._stream_state.tool_call_id_type = self._stream_state.tool_call_id_type
++        # Match the engine's nonstream extract_reasoning policy. Qwen3 starts
++        # streaming deferral disabled until an actual prompt is supplied, while
++        # full-output parsing deliberately uses its configured reasoning mode.
++        reasoning_engine = getattr(replay._reasoning_parser, "_parser_engine", None)
++        if reasoning_engine is not None:
++            reasoning_engine._engine.defer_reasoning_tool_start = bool(
++                reasoning_engine.parser_engine_config.defer_reasoning_tool_start
++            )
++        delta = replay.parse_delta(
++            model_output, list(model_output_token_ids), request,
++            prompt_token_ids=None if replay._reasoning_parser is not None else [],
++            finished=True,
++        )
++        # Expose the replay's diagnostics and token accounting to the caller.
++        self._reasoning_parser = replay._reasoning_parser
++        self._tool_parser = replay._tool_parser
++        self._stream_state = replay._stream_state
++        if delta is None:
++            return None, None, None
++
++        calls: dict[int, dict[str, str]] = {}
++        for tool in delta.tool_calls or []:
++            item = calls.setdefault(tool.index, {"name": "", "arguments": "", "id": ""})
++            if tool.id:
++                item["id"] = tool.id
++            if tool.function:
++                item["name"] += tool.function.name or ""
++                item["arguments"] += tool.function.arguments or ""
++        functions = [
++            FunctionCall(name=item["name"], arguments=item["arguments"], id=item["id"] or None)
++            for _, item in sorted(calls.items())
++        ]
++        return delta.reasoning, delta.content, functions or None
++
+     def parse(
+         self,
+         model_output: str,
+@@ -845,6 +911,20 @@
+         enable_auto_tools: bool = False,
+         model_output_token_ids: Sequence[int] = (),
+     ) -> tuple[str | None, str | None, list[FunctionCall] | None]:
++        reasoning_engine = getattr(self._reasoning_parser, "_parser_engine", None)
++        qwen_token_replay = (
++            reasoning_engine is not None
++            and reasoning_engine.parser_engine_config.name == "qwen3"
++        )
++        if (
++            model_output_token_ids
++            and self._engine_based
++            and enable_auto_tools
++            and qwen_token_replay
++        ):
++            return self._parse_engine_token_ids(
++                model_output, request, model_output_token_ids,
++            )
+         self._initialize_history_tool_call_cnt(request)
+         reasoning, content = self.extract_reasoning(model_output, request)
+         tool_calls, content = self._extract_tool_calls(
+@@ -865,6 +945,9 @@
+     ) -> DeltaMessage | None:
+         self._initialize_history_tool_call_cnt(request)
+         state = self._stream_state
++        prepare_schema = getattr(self._reasoning_parser, "prepare_tool_argument_schema", None)
++        if prepare_schema is not None:
++            prepare_schema(request)
+ 
+         if not state.prompt_reasoning_checked and prompt_token_ids is not None:
+             state.prompt_reasoning_checked = True
+--- a/vllm/parser/engine/adapters.py
++++ b/vllm/parser/engine/adapters.py
+@@ -52,6 +52,25 @@
+         # TODO: Remove once Responses finalization reuses accumulated streaming
+         # parser results instead of reparsing the complete output.
+         self._streaming_count_valid = False
++
++    @property
++    def has_unresolved_reasoning_tool_candidate(self) -> bool:
++        """Preserve unresolved reasoning state through the reasoning adapter."""
++        return self._parser_engine.has_unresolved_reasoning_tool_candidate
++
++    def prepare_tool_argument_schema(self, request):
++        engine = self._parser_engine
++        if engine.parser_engine_config.name == "qwen3":
++            engine._tools = getattr(request, "tools", None)
++            engine._check_skip_tool_parsing(request)
++
++    @property
++    def has_rejected_tool_calls(self):
++        return self._parser_engine.has_rejected_tool_calls
++
++    @property
++    def has_invalid_tool_arguments(self):
++        return bool(getattr(self._parser_engine, "has_invalid_tool_arguments", False))
+ 
+     @contextmanager
+     def _skip_tool_parsing(self) -> Iterator[None]:
+@@ -135,7 +154,11 @@
+ 
+     def finish_streaming(self) -> DeltaMessage | None:
+         with self._skip_tool_parsing():
+-            return self._parser_engine.finish_streaming()
++            return self._parser_engine.finish_streaming(
++                resolve_deferred_tool_start=(
++                    self._parser_engine.parser_engine_config.defer_reasoning_tool_start
++                )
++            )
+ 
+     def get_streaming_fallback_content(
+         self,
+@@ -193,6 +216,15 @@
+     ) -> None:
+         super().__init__(tokenizer, tools)
+         self._parser_engine = self._parser_engine_cls(tokenizer, tools, **kwargs)  # type: ignore[call-arg]
++
++    @property
++    def has_rejected_tool_calls(self) -> bool:
++        """Preserve rejection state when an engine is used as a tool parser."""
++        return self._parser_engine.has_rejected_tool_calls
++
++    @property
++    def has_invalid_tool_arguments(self):
++        return bool(getattr(self._parser_engine, "has_invalid_tool_arguments", False))
+ 
+     @property
+     def skip_reasoning_parsing(self) -> bool:
+--- /dev/null
++++ b/vllm/parser/engine/argument_validation.py
+@@ -0,0 +1,95 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Schema-authoritative, single-layer repair of an accidental arguments wrapper."""
++from __future__ import annotations
++
++import json
++from jsonschema.exceptions import SchemaError, ValidationError
++from jsonschema.validators import validator_for
++from referencing import Registry
++from referencing.exceptions import Unresolvable
++
++
++class InvalidToolArguments(ValueError):
++    """No executable tool call may be emitted; exception never carries payloads."""
++
++
++def _pairs(pairs):
++    result = {}
++    for key, value in pairs:
++        if key in result:
++            raise ValueError("Duplicate JSON object key")
++        result[key] = value
++    return result
++
++
++def _constant(value):
++    raise ValueError("Non-JSON numeric constant")
++
++
++def _loads(value):
++    return json.loads(value, object_pairs_hook=_pairs, parse_constant=_constant)
++
++
++def find_parameters(tools, canonical_name):
++    """Use only the exact already-resolved offered function/namespace name."""
++    matches = []
++    for tool in tools or []:
++        item = tool.model_dump() if hasattr(tool, "model_dump") else tool
++        if not isinstance(item, dict):
++            continue
++        if item.get("type") == "namespace":
++            namespace = item.get("name")
++            for child in item.get("tools", []):
++                if (child.get("type") == "function" and namespace
++                        and namespace + "__" + child.get("name", "") == canonical_name):
++                    matches.append(child.get("parameters"))
++        elif item.get("type") == "function":
++            function = item.get("function", item)
++            if function.get("name") == canonical_name:
++                matches.append(function.get("parameters"))
++    # Duplicate names cannot authorize a schema-based transformation.
++    if len(matches) != 1:
++        return None
++    return matches[0]
++
++
++def validate_or_unwrap(arguments_json, schema):
++    """Preserve valid input exactly; otherwise unwrap once only on full proof.
++
++    An absent schema preserves legacy input, with no inferred requirements or
++    wrapper repair. Unknown/unresolvable supplied schemas fail visibly. No
++    network $ref retrieval, recursive unwrap, coercion or parameter guessing.
++    """
++    if schema is None:
++        return arguments_json
++    try:
++        if isinstance(schema, dict) and "$schema" in schema:
++            validator_cls = validator_for(schema, default=None)
++            if validator_cls is None:
++                raise InvalidToolArguments("Unsupported tool argument schema dialect")
++        else:
++            validator_cls = validator_for(schema)
++        validator_cls.check_schema(schema)
++        # Registry() refuses remote retrieval; local definitions still work.
++        validator = validator_cls(schema, registry=Registry())
++        original = _loads(arguments_json)
++        try:
++            validator.validate(original)
++            return arguments_json
++        except ValidationError:
++            pass
++        if not isinstance(original, dict) or set(original) != {"arguments"}:
++            raise InvalidToolArguments("Tool arguments violate offered schema")
++        inner = original["arguments"]
++        if isinstance(inner, str):
++            inner = _loads(inner)
++        if not isinstance(inner, dict):
++            raise InvalidToolArguments("Tool arguments violate offered schema")
++        validator.validate(inner)
++        return json.dumps(inner, ensure_ascii=False, allow_nan=False)
++    except InvalidToolArguments:
++        raise
++    except (SchemaError, ValidationError, Unresolvable, ValueError, TypeError,
++            KeyError, RecursionError):
++        raise InvalidToolArguments("Tool arguments cannot be validated against offered schema") from None
+--- a/vllm/parser/engine/parser_engine.py
++++ b/vllm/parser/engine/parser_engine.py
+@@ -63,6 +63,8 @@
+         "_args_parts",
+         "_args_joined",
+         "name_sent",
++        "rejection_logged",
++        "closed_explicitly",
+         "string_keys",
+         "_streamed_parts",
+         "_streamed_joined",
+@@ -76,6 +78,8 @@
+         self._args_parts: list[str] = []
+         self._args_joined: str | None = ""
+         self.name_sent: bool = False
++        self.rejection_logged: bool = False
++        self.closed_explicitly: bool = False
+         self.string_keys: set[str] | None = None
+         self._streamed_parts: list[str] = []
+         self._streamed_joined: str | None = ""
+@@ -248,8 +252,12 @@
+         """See :meth:`ReasoningParser.adjust_initial_state_from_prompt`."""
+         return
+ 
+-    def finish_streaming(self) -> DeltaMessage | None:
+-        events = self._engine.finish()
++    def finish_streaming(
++        self, *, resolve_deferred_tool_start: bool = False
++    ) -> DeltaMessage | None:
++        events = self._engine.finish(
++            resolve_deferred_tool_start=resolve_deferred_tool_start
++        )
+         if events or self._deferred_content:
+             return self._events_to_delta(events, finished=True)
+         return None
+@@ -468,8 +476,44 @@
+             return True
+         return find_tool_name(self._tools, name)
+ 
++    def _resolve_tool_name(self, name: str) -> str | None:
++        if not name:
++            return None
++        resolver = self.parser_engine_config.tool_name_resolver
++        if resolver is not None:
++            resolved = resolver(name, self._is_valid_tool_name)
++            # Never permit a resolver to bypass the offered-name allowlist.
++            return resolved if resolved and self._is_valid_tool_name(resolved) else None
++        return name if self._is_valid_tool_name(name) else None
++
+     def _accept_tool_name(self, name: str) -> bool:
+-        return bool(name) and self._is_valid_tool_name(name)
++        return self._resolve_tool_name(name) is not None
++
++    def _log_rejected_tool(self, idx: int) -> None:
++        slot = self._tool_slots[idx]
++        if not slot.rejection_logged:
++            logger.warning(
++                "Rejected tool call: parser=%s index=%s name=%r absent from offered tools",
++                self.parser_engine_config.name,
++                idx,
++                (slot.name or self._try_extract_name(idx) or "")[:256],
++            )
++            slot.rejection_logged = True
++
++    @property
++    def has_unresolved_reasoning_tool_candidate(self) -> bool:
++        """An ambiguous reasoning tool marker remained unresolved at EOF."""
++        return bool(getattr(self._engine, "has_unresolved_reasoning_tool_candidate", False))
++
++    @property
++    def has_rejected_tool_calls(self) -> bool:
++        """Only complete tool names, never malformed opener recovery slots."""
++        return any(
++            slot.rejection_logged
++            and slot.closed_explicitly
++            and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]*", slot.name.strip())
++            for slot in self._tool_slots
++        )
+ 
+     # ── Private helpers ─────────────────────────────────────────────
+ 
+@@ -509,11 +553,14 @@
+         finished: bool,
+     ) -> DeltaMessage | None:
+         self._initialize_history_tool_call_cnt(request)
+-        if not self._prompt_streaming_prepared and prompt_token_ids is not None:
++        if not self._prompt_streaming_prepared:
+             # NOTE: call the hook BEFORE setting the flag, because the hook
+             # may invoke ``_reset`` (e.g. via ``initialize_streaming``) which
+             # clears ``_prompt_streaming_prepared``.
+-            self.adjust_initial_state_from_prompt(prompt_token_ids)
++            if prompt_token_ids is not None:
++                self.adjust_initial_state_from_prompt(prompt_token_ids)
++            elif self.parser_engine_config.defer_reasoning_tool_start:
++                self.adjust_initial_state_from_prompt(())
+             self._prompt_streaming_prepared = True
+         self._check_skip_tool_parsing(request)
+         events = self._feed(delta_text, delta_token_ids)
+@@ -946,7 +993,8 @@
+         deltas: list[DeltaToolCall],
+         name: str | None,
+     ) -> None:
+-        if name is None or not self._accept_tool_name(name):
++        name = self._resolve_tool_name(name or "")
++        if name is None:
+             return
+         slot = self._tool_slots[idx]
+         slot.name = name
+@@ -1001,12 +1049,21 @@
+         if idx >= len(self._tool_slots):
+             return
+ 
++        slot = self._tool_slots[idx]
++        # A later EOF flush must not erase an observed explicit closer.
++        slot.closed_explicitly = slot.closed_explicitly or event.value in (
++            self.parser_engine_config.terminals.get("FUNC_END"),
++            self.parser_engine_config.terminals.get("TOOL_END"),
++        )
++        name = self._resolve_tool_name(slot.name or self._try_extract_name(idx) or "")
++        if name is not None:
++            slot.name = name
+         remaining = self._flush_arg_converter(idx)
+-        slot = self._tool_slots[idx]
++        if self._arguments_block_emission(idx):
++            return
+ 
+         if not slot.name_sent:
+-            name = slot.name or self._try_extract_name(idx) or ""
+-            if self._accept_tool_name(name):
++            if name is not None:
+                 slot.name = name
+                 slot.name_sent = True
+                 slot.string_keys = self._streamable_string_keys(
+@@ -1025,6 +1082,8 @@
+                     )
+                 )
+                 remaining = None
++            elif slot.name or slot.args:
++                self._log_rejected_tool(idx)
+ 
+         if remaining and slot.name_sent:
+             deltas.append(
+@@ -1068,6 +1127,18 @@
+ 
+     # ── Arg conversion helpers ─────────────────────────────────────────
+ 
++    def _normalize_tool_arguments(self, value: str, name: str, idx: int) -> str | None:
++        return value
++
++    def _arguments_block_emission(self, idx: int) -> bool:
++        return False
++
++    def _skip_incomplete_tool_slot(self, idx: int) -> bool:
++        return False
++
++    def _buffer_ambiguous_arguments(self, idx: int, value: str) -> bool:
++        return False
++
+     def _compute_arg_delta(self, idx: int, raw_delta: str) -> str | None:
+         converter = self._arg_converter
+         if converter is None:
+@@ -1101,6 +1172,8 @@
+         if slot.name:
+             current_json = self._fix_arg_types(current_json, slot.name)
+ 
++        if self._buffer_ambiguous_arguments(idx, current_json):
++            return None
+         prev = slot.streamed_json
+         safe_json, value_streams = self._safe_arg_prefix(current_json, slot.string_keys)
+ 
+@@ -1130,6 +1203,9 @@
+ 
+         if final_json:
+             final_json = self._fix_arg_types(final_json, slot.name)
++            final_json = self._normalize_tool_arguments(final_json, slot.name, idx)
++            if final_json is None:
++                return None
+ 
+         prev = slot.streamed_json
+         if final_json and len(final_json) > len(prev):
+@@ -1163,10 +1239,15 @@
+ 
+         tool_calls: list[ToolCall] = []
+         for idx, slot in enumerate(self._tool_slots):
++            if self._skip_incomplete_tool_slot(idx):
++                continue
+             if not slot.name and not slot.args:
+                 continue
+ 
+-            name = slot.name.strip()
++            name = (
++                slot.name if self.parser_engine_config.tool_name_resolver is not None
++                else slot.name.strip()
++            )
+             raw_body = slot.args
+ 
+             if not name and raw_body.strip():
+@@ -1186,15 +1267,22 @@
+             else:
+                 args_json = "{}"
+ 
+-            if self._accept_tool_name(name):
++            name = self._resolve_tool_name(name)
++            if name is not None:
++                slot.name = name
+                 self._ensure_tool_id(slot, name)
+                 args_json = self._fix_arg_types(args_json, name)
++                args_json = self._normalize_tool_arguments(args_json, name, idx)
++                if args_json is None:
++                    continue
+                 tool_calls.append(
+                     ToolCall(
+                         id=slot.id,
+                         function=FunctionCall(name=name, arguments=args_json),
+                     )
+                 )
++            else:
++                self._log_rejected_tool(idx)
+ 
+         content_str = "".join(content_parts)
+         content = self._strip_content_whitespace(content_str, len(tool_calls) > 0)
+--- a/vllm/parser/engine/parser_engine_config.py
++++ b/vllm/parser/engine/parser_engine_config.py
+@@ -126,6 +126,22 @@
+     # Reject tool calls whose names are absent from the request tools.
+     validate_tool_names: bool = False
+ 
++    # Optional model-specific resolver; it may only select a valid offered name.
++    tool_name_resolver: (
++        Callable[[str, Callable[[str], bool]], str | None] | None
++    ) = None
++
++    # Delay a tool wrapper until its whitespace-only preamble reaches TOOL_NAME.
++    validate_tool_preamble: bool = False
++
++    # Treat a tool marker that cannot be opening a real call as literal text:
++    # one inside a fenced code block, or a wrapper-less function header that
++    # does not start a line.
++    guard_literal_tool_markers: bool = False
++
++    # Hold ambiguous tool markup in open reasoning until its channel is known.
++    defer_reasoning_tool_start: bool = False
++
+     def __post_init__(self) -> None:
+         if self.arg_value_extender is not None and (
+             self.arg_converter is None or not self.stream_arg_deltas
+--- a/vllm/parser/engine/streaming_parser_engine.py
++++ b/vllm/parser/engine/streaming_parser_engine.py
+@@ -117,6 +117,7 @@
+         vocab: dict[str, int] | None = None,
+     ) -> None:
+         self.config = config
++        self.defer_reasoning_tool_start = config.defer_reasoning_tool_start
+ 
+         resolved_token_ids: dict[int, str] = {}
+         if tokenizer is not None:
+@@ -162,6 +163,14 @@
+             terminal
+             for (state, terminal), tr in config.transitions.items()
+             if state in self._TOOL_STATES and tr.next_state not in self._TOOL_STATES
++        )
++        # Headers that open a call with no wrapper before them — qwen3's
++        # ``<function=`` fallback. Only credible at the start of a line.
++        self._bare_tool_headers: frozenset[str] = frozenset(
++            terminal
++            for (state, terminal), tr in config.transitions.items()
++            if state in (ParserState.CONTENT, ParserState.REASONING)
++            and tr.next_state == ParserState.TOOL_NAME
+         )
+ 
+         self._reasoning_markup_terminals: frozenset[str] = (
+@@ -218,6 +227,13 @@
+         self._message_header_buffer = ""
+         self._message_header_token_count = 0
+         self._in_skipped_tool_span = False
++        self._pending_reasoning_tool_tokens: list[tuple[str, str, int]] | None = None
++        self.has_unresolved_reasoning_tool_candidate = False
++        self._saw_reasoning_tool_literal = False
++        self._pending_tool_start: tuple[str, str, int] | None = None
++        self._tool_preamble_buffer = ""
++        self._tool_preamble_token_count = 0
++        self._reset_marker_guard()
+         self._reset_args_state()
+         self._reset_array_state()
+ 
+@@ -235,6 +251,7 @@
+             delta_text
+             and not self._lexer.buffer
+             and not self._scanner._deferred_terminals
++            and self._pending_reasoning_tool_tokens is None
+             and self._lexer._literal_first_chars.isdisjoint(delta_text)
+         ):
+             has_special = False
+@@ -291,10 +308,65 @@
+                     )
+         return events
+ 
+-    def finish(self) -> list[SemanticEvent]:
++    @staticmethod
++    def _has_complete_deferred_function_header(
++        pending: list[tuple[str, str, int]],
++    ) -> bool:
++        name: str | None = None
++        for terminal, value, _ in pending:
++            if terminal == "FUNC_PREFIX":
++                name = ""
++            elif name is not None:
++                if terminal == "CLOSE_ANGLE" and name.strip():
++                    return True
++                if terminal == CONTENT_TERMINAL:
++                    name += value
++                else:
++                    name = None
++        return False
++
++    def finish(
++        self, *, resolve_deferred_tool_start: bool = False
++    ) -> list[SemanticEvent]:
+         events = self._process_scanner_items(self._scanner.flush_pending())
+ 
+         events.extend(self._process_lex_tokens(self._lexer.flush()))
++
++        # Without an explicit reasoning closer, a genuine tool opener ends
++        # reasoning implicitly. Replay only after that ambiguity is resolved.
++        if self._pending_reasoning_tool_tokens is not None:
++            pending = self._pending_reasoning_tool_tokens
++            self._pending_reasoning_tool_tokens = None
++            skip_tool_parsing = self.skip_tool_parsing
++            defer_reasoning_tool_start = self.defer_reasoning_tool_start
++            self.defer_reasoning_tool_start = False
++            if resolve_deferred_tool_start:
++                self.skip_tool_parsing = False
++            try:
++                # Replay in the original channel. Only a confirmed function
++                # preamble may perform the implicit reasoning-end transition.
++                if self._has_complete_deferred_function_header(pending):
++                    for terminal, value, token_count in pending:
++                        if terminal == CONTENT_TERMINAL:
++                            events.extend(self._on_content(value, token_count))
++                        else:
++                            events.extend(self._on_terminal(terminal, value, token_count))
++                else:
++                    for terminal, value, token_count in pending:
++                        if terminal != DROP_TERMINAL:
++                            events.extend(self._emit_for_state(value, token_count))
++                if self.state is ParserState.REASONING:
++                    events.extend(self._flush_tool_preamble())
++                self.has_unresolved_reasoning_tool_candidate = self.state in (
++                    ParserState.REASONING,
++                    ParserState.TOOL_PREAMBLE,
++                    ParserState.TOOL_NAME,
++                )
++            finally:
++                self.skip_tool_parsing = skip_tool_parsing
++                self.defer_reasoning_tool_start = defer_reasoning_tool_start
++
++        events.extend(self._confirm_tool_preamble())
+ 
+         if self._args_buffer:
+             events.append(
+@@ -327,6 +399,8 @@
+                 )
+             self.state = ParserState.CONTENT
+         elif self.state == ParserState.REASONING:
++            if self._saw_reasoning_tool_literal:
++                self.has_unresolved_reasoning_tool_candidate = True
+             events.append(
+                 SemanticEvent(EventType.REASONING_END, tool_index=self.tool_index)
+             )
+@@ -407,13 +481,56 @@
+         return markers
+ 
+     def _on_terminal(
+-        self, terminal: str, value: str, token_count: int = 0
++        self,
++        terminal: str,
++        value: str,
++        token_count: int = 0,
++        *,
++        confirmed_tool_start: bool = False,
+     ) -> list[SemanticEvent]:
++        pending = self._pending_reasoning_tool_tokens
++        if pending is not None:
++            if terminal == "THINK_END":
++                self._pending_reasoning_tool_tokens = None
++                events = [
++                    SemanticEvent(
++                        EventType.REASONING_CHUNK,
++                        value=held_value,
++                        token_count=held_token_count,
++                    )
++                    for held_terminal, held_value, held_token_count in pending
++                    if held_terminal != DROP_TERMINAL
++                ]
++                transition = self.config.transitions.get((self.state, terminal))
++                if transition is not None:
++                    events.extend(self._apply_transition(transition, value, token_count))
++                else:
++                    events.extend(self._emit_for_state(value, token_count))
++                return events
++            pending.append((terminal, value, token_count))
++            return []
++
++        if self._pending_tool_start is not None:
++            next_transition = self.config.transitions.get(
++                (ParserState.TOOL_PREAMBLE, terminal)
++            )
++            if next_transition is not None and next_transition.next_state in (
++                ParserState.TOOL_NAME,
++                ParserState.CONTENT,
++            ):
++                events = self._confirm_tool_preamble()
++                events.extend(self._on_terminal(terminal, value, token_count))
++                return events
++            events = self._flush_tool_preamble()
++            events.extend(self._on_terminal(terminal, value, token_count))
++            return events
++
+         key = (self.state, terminal)
+         transition = self.config.transitions.get(key)
+ 
+         if transition is None:
+             if self._has_drops and terminal == DROP_TERMINAL:
++                # Control tokens are protocol delimiters, never user text.
+                 return []
+             # The projected skip state may not define the wrapper closer.
+             if self.skip_tool_parsing and terminal in self._tool_exit_terminals:
+@@ -422,6 +539,35 @@
+ 
+         if self.skip_reasoning_parsing and terminal in self._reasoning_markup_terminals:
+             return self._emit_for_state(value, token_count)
++
++        if (
++            self.config.guard_literal_tool_markers
++            and not confirmed_tool_start
++            and self.state in (ParserState.CONTENT, ParserState.REASONING)
++            and transition.next_state in self._TOOL_STATES
++            and self._marker_is_literal(terminal)
++        ):
++            if self.state is ParserState.REASONING:
++                self._saw_reasoning_tool_literal = True
++            return self._emit_for_state(value, token_count)
++
++        if (
++            self.defer_reasoning_tool_start
++            and self.state is ParserState.REASONING
++            and terminal == "TOOL_START"
++            and not confirmed_tool_start
++        ):
++            self._pending_reasoning_tool_tokens = [(terminal, value, token_count)]
++            return []
++
++        if (
++            self.config.validate_tool_preamble
++            and not confirmed_tool_start
++            and self.state in (ParserState.CONTENT, ParserState.REASONING)
++            and transition.next_state == ParserState.TOOL_PREAMBLE
++        ):
++            self._pending_tool_start = (terminal, value, token_count)
++            return []
+ 
+         if self.skip_tool_parsing and terminal in self._tool_terminals:
+             # Inkling reuses one terminal for tool, text, and reasoning exits.
+@@ -480,7 +626,132 @@
+ 
+         return self._apply_transition(transition, value, token_count)
+ 
++    def _reset_marker_guard(self) -> None:
++        self._marker_guard_state: ParserState | None = self.state
++        self._fence_open_run = 0
++        self._fence_open_char = ""
++        self._close_pending = False
++        self._begin_line()
++
++    def _begin_line(self) -> None:
++        self._line_state = "indent"
++        self._line_indent = 0
++        self._fence_run = 0
++        self._fence_run_char = ""
++
++    def _resolve_fence_run(self) -> None:
++        """Act on the fence run that just ended on this line.
++
++        CommonMark: a run of three or more opens, and only a run of the same
++        character at least as long closes. A shorter inner fence therefore
++        does not close the block around it.
++        """
++        run, char = self._fence_run, self._fence_run_char
++        self._fence_run = 0
++        self._line_state = "body"
++        if run < 3:
++            return
++        if not self._fence_open_run:
++            self._fence_open_run = run
++            self._fence_open_char = char
++        elif char == self._fence_open_char and run >= self._fence_open_run:
++            # Only a closer if nothing but whitespace follows it.
++            self._close_pending = True
++
++    def _sync_marker_guard(self) -> None:
++        """Reasoning and content are separate documents.
++
++        A fence left open in one must not carry into the other, and the
++        channel can change with no text in between (``</think><tool_call>``),
++        so this is checked on use as well as on the next chunk of text.
++        """
++        if self.state is not self._marker_guard_state:
++            self._reset_marker_guard()
++
++    def _marker_is_literal(self, terminal: str) -> bool:
++        """Report a tool marker the model cannot be using to open a call.
++
++        Inside a fenced code block it is quoting the format: Qwen emits a
++        call as bare markup, never from inside a fence. A wrapper-less
++        function header is a call only when it starts a line; mid-line it
++        is prose naming the marker.
++        """
++        self._sync_marker_guard()
++        if self._line_state == "run":
++            self._resolve_fence_run()
++        if self._fence_open_run:
++            return True
++        at_line_start = self._line_state != "body"
++        return terminal in self._bare_tool_headers and not at_line_start
++
++    def _track_literal_text(self, text: str) -> None:
++        """Follow fence state and line-start position through plain text."""
++        self._sync_marker_guard()
++        for ch in text:
++            if ch == "\n":
++                if self._line_state == "run":
++                    self._resolve_fence_run()
++                if self._close_pending:
++                    self._fence_open_run = 0
++                    self._fence_open_char = ""
++                    self._close_pending = False
++                self._begin_line()
++                continue
++            if self._line_state == "indent":
++                # Four or more leading spaces is indented code, not a fence.
++                if ch in " \t" and self._line_indent < 3:
++                    self._line_indent += 1
++                    continue
++                if ch in "`~":
++                    self._line_state = "run"
++                    self._fence_run_char = ch
++                    self._fence_run = 1
++                    continue
++                self._line_state = "body"
++                continue
++            if self._line_state == "run":
++                if ch == self._fence_run_char:
++                    self._fence_run += 1
++                    continue
++                self._resolve_fence_run()
++            if self._close_pending and ch not in " \t":
++                self._close_pending = False
++
+     def _emit_for_state(self, text: str, token_count: int = 0) -> list[SemanticEvent]:
++        if self._pending_reasoning_tool_tokens is not None:
++            self._pending_reasoning_tool_tokens.append(
++                (CONTENT_TERMINAL, text, token_count)
++            )
++            return []
++        # A deferred wrapper replays its buffer through here once it is
++        # flushed; tracking it now would count every fence in it twice.
++        if (
++            self.config.guard_literal_tool_markers
++            and text
++            and self._pending_tool_start is None
++            and self.state in (ParserState.CONTENT, ParserState.REASONING)
++        ):
++            self._track_literal_text(text)
++        if self._pending_tool_start is not None:
++            self._tool_preamble_buffer += text
++            self._tool_preamble_token_count += token_count
++            if text.strip():
++                candidate = self._tool_preamble_buffer.lstrip()
++                for (state, terminal), tr in self.config.transitions.items():
++                    if (
++                        state == ParserState.TOOL_PREAMBLE
++                        and tr.next_state == ParserState.TOOL_NAME
++                        and (literal := self.config.terminals.get(terminal))
++                        and any(
++                            value.startswith(candidate)
++                            for value in (
++                                (literal,) if isinstance(literal, str) else literal
++                            )
++                        )
++                    ):
++                        return []
++                return self._flush_tool_preamble()
++            return []
+         if self.state == ParserState.MESSAGE_HEADER:
+             self._message_header_buffer += text
+             self._message_header_token_count += token_count
+@@ -510,7 +781,36 @@
+             ]
+         return []
+ 
++    def _flush_tool_preamble(self) -> list[SemanticEvent]:
++        if self._pending_tool_start is None:
++            return []
++        _, opener, opener_count = self._pending_tool_start
++        text = opener + self._tool_preamble_buffer
++        count = opener_count + self._tool_preamble_token_count
++        self._pending_tool_start = None
++        self._tool_preamble_buffer = ""
++        self._tool_preamble_token_count = 0
++        return self._emit_for_state(text, count)
++
++    def _confirm_tool_preamble(self) -> list[SemanticEvent]:
++        if self._pending_tool_start is None:
++            return []
++        opener = self._pending_tool_start
++        text = self._tool_preamble_buffer
++        count = self._tool_preamble_token_count
++        self._pending_tool_start = None
++        self._tool_preamble_buffer = ""
++        self._tool_preamble_token_count = 0
++        events = self._on_terminal(*opener, confirmed_tool_start=True)
++        events.extend(self._emit_for_state(text, count))
++        return events
++
+     def _on_content(self, text: str, token_count: int = 0) -> list[SemanticEvent]:
++        if self._pending_reasoning_tool_tokens is not None:
++            self._pending_reasoning_tool_tokens.append(
++                (CONTENT_TERMINAL, text, token_count)
++            )
++            return []
+         if not text:
+             return []
+         return self._emit_for_state(text, token_count)
+--- a/vllm/parser/nemotron_v3.py
++++ b/vllm/parser/nemotron_v3.py
+@@ -35,6 +35,7 @@
+     return dataclasses.replace(
+         qwen3_config(thinking=thinking, turn_boundary_tokens=CHATML_TURN_BOUNDARIES),
+         name="nemotron_v3",
++        validate_tool_preamble=False,
+         strip_trailing_reasoning_whitespace=True,
+     )
+ 
+--- a/vllm/parser/qwen3.py
++++ b/vllm/parser/qwen3.py
+@@ -18,6 +18,8 @@
+ 
+ import functools
+ import json
++from collections.abc import Sequence
++from dataclasses import replace
+ from typing import TYPE_CHECKING
+ 
+ import regex as re
+@@ -69,13 +71,15 @@
+ 
+ def _qwen3_arg_converter(raw_args: str, partial: bool) -> str:
+     params: dict[str, object] = {}
++    closed = raw_args.endswith(FUNC_END)
++    raw_args = raw_args.removesuffix(FUNC_END)
+ 
+     for match in _PARAM_RE.finditer(raw_args):
+         name = match.group(1)
+         value = match.group(2)
+         params[name] = _trim_wrapping_newlines(value)
+ 
+-    if partial:
++    if partial or closed:
+         remaining = _PARAM_RE.sub("", raw_args)
+         m = _PARTIAL_PARAM_RE.search(remaining)
+         if m:
+@@ -85,6 +89,21 @@
+                 params[name] = _trim_wrapping_newlines(value)
+ 
+     return json.dumps(params, ensure_ascii=False)
++
++
++def _qwen3_tool_name_resolver(name: str, is_valid) -> str | None:
++    """Resolve only exact offered names or known namespaces around them."""
++    if name and is_valid(name):
++        return name
++    stripped = name.strip()
++    if stripped and is_valid(stripped):
++        return stripped
++    for prefix in ("functions.", "tools."):
++        if stripped.startswith(prefix):
++            candidate = stripped[len(prefix):]
++            if candidate and is_valid(candidate):
++                return candidate
++    return None
+ 
+ 
+ # What ends an open value in ``_PARAM_RE``: a closing tag or the next opener.
+@@ -158,6 +177,8 @@
+ ) -> ParserEngineConfig:
+     return ParserEngineConfig(
+         name=name,
++        validate_tool_names=True,
++        tool_name_resolver=_qwen3_tool_name_resolver if name == "qwen3" else None,
+         initial_state=ParserState.REASONING if thinking else ParserState.CONTENT,
+         wait_for_reasoning=thinking,
+         turn_boundary_tokens=turn_boundary_tokens,
+@@ -251,7 +272,12 @@
+             ),
+             (ParserState.TOOL_ARGS, "FUNC_END"): Transition(
+                 ParserState.TOOL_BETWEEN,
+-                (EventType.TOOL_CALL_END,),
++                (EventType.ARG_VALUE_CHUNK, EventType.TOOL_CALL_END),
++            ),
++            # Consecutive tool call without closing </function>
++            (ParserState.TOOL_ARGS, "FUNC_PREFIX"): Transition(
++                ParserState.TOOL_NAME,
++                (EventType.TOOL_CALL_END, EventType.TOOL_CALL_START),
+             ),
+             # regression issue 58227
+             # <function=abc>...<function=
+@@ -286,6 +312,8 @@
+         stream_arg_deltas=True,
+         strip_trailing_reasoning_whitespace=False,
+         tool_args_json=False,
++        validate_tool_preamble=True,
++        guard_literal_tool_markers=True,
+     )
+ 
+ 
+@@ -316,9 +344,8 @@
+     ) -> None:
+         chat_kwargs = kwargs.get("chat_template_kwargs", {}) or {}
+         self.thinking_enabled = chat_kwargs.get("enable_thinking", True)
+-        kwargs.setdefault(
+-            "parser_engine_config",
+-            qwen3_config(
++        if "parser_engine_config" not in kwargs:
++            parser_engine_config = qwen3_config(
+                 thinking=self.thinking_enabled,
+                 name=self.CONFIG_NAME,
+                 think_start=self.THINK_START,
+@@ -326,13 +353,165 @@
+                 tool_start=self.TOOL_START,
+                 tool_end=self.TOOL_END,
+                 turn_boundary_tokens=self.TURN_BOUNDARIES,
+-            ),
+-        )
++            )
++            if self.CONFIG_NAME == "qwen3":
++                parser_engine_config = replace(
++                    parser_engine_config,
++                    defer_reasoning_tool_start=self.thinking_enabled,
++                )
++            kwargs["parser_engine_config"] = parser_engine_config
+         super().__init__(
+             tokenizer,
+             tools,
+             **kwargs,
+         )
++        if self.parser_engine_config.defer_reasoning_tool_start:
++            self._engine.defer_reasoning_tool_start = False
++        self._chat_tool_name_passthrough = False
++        self._schema_arguments_strict = False
++        self._invalid_argument_slots = set()
++        self._schema_catalog = None
++        self._argument_schemas = {}
++
++    def _check_skip_tool_parsing(
++        self, request: ChatCompletionRequest | ResponsesRequest
++    ) -> None:
++        super()._check_skip_tool_parsing(request)
++        # Responses consumers execute completed function-call items. Buffer XML
++        # arguments there until the call closes, so an unfinished parameter is
++        # never presented as a complete JSON value. Keep Chat Completions' v0.31
++        # incremental argument contract, including pre-parameter-end deltas.
++        from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
++
++        self._stream_arg_deltas = (
++            self.parser_engine_config.stream_arg_deltas
++            and not isinstance(request, ResponsesRequest)
++        )
++        # Preserve Chat Completions' pre-patch-19 tool-name contract: the
++        # client receives an unoffered name and can reject/recover the call.
++        # Responses retains its explicit failure policy. Keep this per-parser,
++        # never mutate the cached configuration shared by concurrent requests.
++        self._schema_arguments_strict = isinstance(request, ResponsesRequest)
++        self._chat_tool_name_passthrough = (
++            self.parser_engine_config.name == "qwen3"
++            and not isinstance(request, ResponsesRequest)
++        )
++
++    def _resolve_tool_name(self, name: str) -> str | None:
++        resolved = super()._resolve_tool_name(name)
++        if resolved is not None:
++            return resolved
++        if self._chat_tool_name_passthrough:
++            stripped = name.strip()
++            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]*", stripped):
++                # Preserve the actual name; never map unknown tools to an
++                # offered shell/file tool. Known aliases were resolved above.
++                return stripped
++        return None
++
++    def _reset(self, initial_state=None) -> None:
++        super()._reset(initial_state=initial_state)
++        self._invalid_argument_slots = set()
++
++    @property
++    def has_invalid_tool_arguments(self):
++        return bool(self._invalid_argument_slots)
++
++    def _schema_for_tool(self, name):
++        if self.parser_engine_config.name != "qwen3":
++            return None
++        from vllm.parser.engine.argument_validation import find_parameters
++        if self._schema_catalog is not self._tools:
++            self._schema_catalog = self._tools
++            self._argument_schemas = {}
++        if name not in self._argument_schemas:
++            self._argument_schemas[name] = find_parameters(self._tools, name)
++        return self._argument_schemas[name]
++
++    def _normalize_tool_arguments(self, value, name, idx):
++        from vllm.parser.engine.argument_validation import InvalidToolArguments, validate_or_unwrap
++        schema = self._schema_for_tool(name)
++        if schema is None:
++            return value
++        try:
++            return validate_or_unwrap(value, schema)
++        except InvalidToolArguments:
++            if not self._schema_arguments_strict:
++                # Chat clients retain their previous argument-error/recovery path.
++                return value
++            self._invalid_argument_slots.add(idx)
++            self._tool_slots[idx].rejection_logged = True
++            return None
++
++    def _arguments_block_emission(self, idx):
++        return idx in self._invalid_argument_slots
++
++    def _skip_incomplete_tool_slot(self, idx):
++        slot = self._tool_slots[idx]
++        return self._arguments_block_emission(idx) or (
++            self._schema_arguments_strict and not slot.closed_explicitly
++            and self._schema_for_tool(slot.name) is not None
++        )
++
++    def _buffer_ambiguous_arguments(self, idx, value):
++        # Normal Chat calls keep incremental arguments. Only a possible wrapper
++        # waits for closure, since emitted argument bytes cannot be rewritten.
++        slot = self._tool_slots[idx]
++        if self._schema_for_tool(slot.name) is None:
++            return False
++        try:
++            parsed = json.loads(value)
++        except (ValueError, TypeError):
++            return False
++        return isinstance(parsed, dict) and set(parsed) == {"arguments"}
++
++    def _emit_name_delta(self, idx, deltas, name):
++        slot = self._tool_slots[idx]
++        resolved = self._resolve_tool_name(name or "") or name or ""
++        if (self._schema_arguments_strict and not slot.closed_explicitly
++                and self._schema_for_tool(resolved) is not None):
++            return
++        return super()._emit_name_delta(idx, deltas, name)
++
++    def _handle_tool_end(self, event, deltas):
++        idx = event.tool_index
++        if idx >= len(self._tool_slots):
++            return
++        slot = self._tool_slots[idx]
++        slot.closed_explicitly = slot.closed_explicitly or event.value in (
++            self.parser_engine_config.terminals.get("FUNC_END"),
++            self.parser_engine_config.terminals.get("TOOL_END"),
++        )
++        name = self._resolve_tool_name(slot.name or self._try_extract_name(idx) or "")
++        if (self._schema_arguments_strict and not slot.closed_explicitly
++                and self._schema_for_tool(name or "") is not None):
++            return
++        return super()._handle_tool_end(event, deltas)
++
++    def adjust_initial_state_from_prompt(self, prompt_token_ids: Sequence[int]) -> None:
++        if not self.parser_engine_config.defer_reasoning_tool_start:
++            return
++        prompt_has_open_think = False
++        for token_id in reversed(prompt_token_ids):
++            if token_id in self._turn_boundary_token_ids:
++                break
++            if token_id in self._reasoning_end_token_ids:
++                break
++            if token_id == self._reasoning_start_token_id:
++                prompt_has_open_think = True
++                break
++        self._engine.defer_reasoning_tool_start = prompt_has_open_think
++        self._streaming_initialized = True
++
++    def _single_pass_parse(self, text: str, token_ids: Sequence[int], initial_state=None):
++        previous = self._engine.defer_reasoning_tool_start
++        self._engine.defer_reasoning_tool_start = bool(
++            self.parser_engine_config.defer_reasoning_tool_start
++        )
++        try:
++            return super()._single_pass_parse(text, token_ids, initial_state)
++        finally:
++            self._engine.defer_reasoning_tool_start = previous
+ 
+     def extract_reasoning(
+         self,
+@@ -341,4 +520,11 @@
+     ) -> tuple[str | None, str | None]:
+         if not self.thinking_enabled:
+             return None, model_output
+-        return super().extract_reasoning(model_output, request)
++        previous = self._engine.defer_reasoning_tool_start
++        self._engine.defer_reasoning_tool_start = bool(
++            self.parser_engine_config.defer_reasoning_tool_start
++        )
++        try:
++            return super().extract_reasoning(model_output, request)
++        finally:
++            self._engine.defer_reasoning_tool_start = previous

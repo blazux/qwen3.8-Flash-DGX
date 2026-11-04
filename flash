@@ -73,12 +73,12 @@ load_profile() {
   export NAME="${NAME:-qwen38-flash}" PORT="${PORT:-18300}" MODE="${MODE:-nvfp4}"
   export MODEL="${MODEL:-$MODEL_DEFAULT}" HF_CACHE="${HF_CACHE:-$HOME/.cache/huggingface}"
   export GPU_MEM="${GPU_MEM:-0.80}" KV_DTYPE="${KV_DTYPE:-auto}"
-  export IMAGE="${IMAGE:-qwen38-flash-dgx:v0.32}"
+  export IMAGE="${IMAGE:-qwen38-flash-dgx:v0.33}"
   export DRAFT_MODEL="${DRAFT_MODEL:-}" DRAFT_TOKENS="${DRAFT_TOKENS:-4}"
 }
 
 # The image must match the current recipe. Retain old images locally for rollback.
-BASE_EXPECTED=v0.32
+BASE_EXPECTED=v0.33
 
 # Same snapshot resolution as scripts/serve.sh (refs/main first).
 snapshot_dir() {

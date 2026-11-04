@@ -8,7 +8,7 @@ greedy decoding**, and up to **500k tokens of context**.
 The catch this repo solves: the NVFP4 checkpoint is **~125 GiB**, which does not fit
 next to a usable KV cache in the Spark's **128 GB unified pool**. 48 GiB of that is
 the n-gram embedding ("PLE") table — a pure lookup that a token only touches 16 rows
-of. This repo patches the official vLLM v0.32.0 image to **serve that table from NVMe via
+of. This repo patches the official vLLM v0.33.0 image to **serve that table from NVMe via
 `mmap`** instead of keeping it resident. Weights drop to **~75 GiB**, the rest of the
 pool goes to KV, and everything runs on stock GB10 kernels.
 
@@ -37,7 +37,7 @@ be overridden on the command line (`./flash serve default MTP=3 PORT=18301`). `.
 The same thing by hand, unchanged and still supported (everything `flash` does is these scripts):
 
 ```bash
-docker build -t qwen38-flash-dgx:v0.32 .      # official vLLM v0.32.0 image + the patches below
+docker build -t qwen38-flash-dgx:v0.33 .      # official vLLM v0.33.0 image + the patches below
 scripts/download-weights.sh                   # nvidia/Qwen3.8-Flash-Next-NVFP4, ~124 GiB via Xet, resumable (one-time)
 scripts/prepare-hybrid.sh                     # recommended: fp8 side layers, +20% decode, same quality (~10 min, one-time)
 MODE=hybrid YARN=1 CTX=500000 scripts/serve.sh   # the recommended recipe; 500k context, ~3-4 min to load
@@ -63,9 +63,17 @@ Everything below is the long version: what was broken on GB10, what was fixed, a
 > [issue #1](https://github.com/blazux/qwen3.8-Flash-DGX/issues/1) and their
 > [write-up](https://github.com/jschmied/qwen38-flash-next-gb10).
 
-## vLLM v0.32 base (issues #58 and #59)
+## vLLM v0.33 upgrade
 
-The recipe now builds on the official v0.32.0 image. Existing prepared hybrid
+The recipe builds on the official v0.33.0 image. Run `./flash setup` with
+your usual profile and recreate the container. Existing prepared hybrid
+checkpoints can be reused. Keep the previous container or image available for
+rollback. The optional `mtp-fast` profile pairs a quantized draft head with
+a larger prefill batch. See the [port notes and workload measurements](docs/VLLM-033.md).
+
+### Previous vLLM v0.32 port (issues #58 and #59)
+
+The v0.32 port moved the recipe onto the official v0.32.0 image. Existing prepared hybrid
 checkpoints are reusable. Rebuild with `./flash setup`, then recreate the server
 with your usual profile and overrides. The checkpoint and profile defaults are
 unchanged. See [port details and validation](docs/VLLM-032.md).
@@ -76,8 +84,7 @@ fusion. QSA supports BF16 and FP8-e4m3 KV, including upstream layer skips; this
 port does not enable NVFP4 KV. See the linked validation for the tested settings
 and measurements. The v0.32 probes show comparable throughput, with no established
 speedup. Performance and tournament figures elsewhere in this README remain
-historical unless explicitly labeled v0.32; the full tournament has not been
-rerun for this release.
+historical unless explicitly labeled v0.32; the scope of the original port validation is recorded in the linked notes.
 
 ### Long-context MTP crash fix (issue #60)
 
@@ -91,7 +98,7 @@ window in both paths, preserving existing table rows and the YaRN frequency base
 It is adapted from [@wtogami](https://github.com/wtogami)'s
 [vLLM #62409](https://github.com/vllm-project/vllm/pull/62409).
 
-Existing v0.32 installations need an explicit rebuild and container recreation:
+For a checkout of the v0.32 recipe, rebuild and recreate the container to apply patch 22:
 
 ```bash
 docker build -t qwen38-flash-dgx:v0.32 .
@@ -117,7 +124,7 @@ the reported workarounds. See [reproduction and validation](docs/VLLM-032.md#lon
 | 2026-10-09 | **Hybrid preparation and memory diagnostics:** support regular-file and hardlinked checkpoint indexes without modifying the original snapshot ([#50](https://github.com/blazux/qwen3.8-Flash-DGX/issues/50)); add [optional startup-memory diagnostics](docs/VLLM-031.md#optional-diagnostic-images) for automatic KV sizing ([#51](https://github.com/blazux/qwen3.8-Flash-DGX/issues/51)). |
 | 2026-10-08 | **Official vLLM v0.31 base:** [PR #49](https://github.com/blazux/qwen3.8-Flash-DGX/pull/49), contributed by **[@mercant1982](https://github.com/mercant1982)**; existing prepared checkpoints are reusable. [Upgrade and validation](#update-2026-10-08--vllm-v031-migration). |
 
-For source-only fixes on an existing v0.32 installation, **rebuild the image**;
+For source-only fixes on an existing installation, **rebuild the image**;
 `./flash setup` skips an already-built image with the current base label. See the
 [rebuild instructions](#parser-and-responses-output-fixes-issue-31).
 
@@ -167,7 +174,7 @@ Not covered, both deliberate:
   parsed. That is the cost of deciding from the text alone;
   `test_unclosed_fence_suppresses_later_calls` asserts it so a change is deliberate.
 
-The regression patches extend vLLM's Qwen parser tests. To run them from a vLLM v0.32.0
+The historical regression patches extend vLLM's Qwen parser tests. To run them from a vLLM v0.32.0
 source checkout with its test dependencies installed (using absolute paths to
 this repository's patch files):
 
@@ -221,8 +228,8 @@ patch 20 has **4 CPU configuration checks**. These and the original 67 + 21
 checks pass, with no new parser-engine failures.
 
 To update an existing installation, rebuild with
-`docker build -t qwen38-flash-dgx:v0.32 .`, then recreate the container with your
-usual profile and overrides. `./flash setup` reuses an existing v0.32 image and
+`docker build -t qwen38-flash-dgx:v0.33 .`, then recreate the container with your
+usual profile and overrides. `./flash setup` reuses an existing image with the current base label and
 does not rebuild it for source-only fixes.
 
 ### Schema-validated tool arguments (issue #31)
@@ -353,6 +360,7 @@ Profiles (`profiles/*.env`, each a handful of `serve.sh` variables; copy one to 
 | --- | --- | --- |
 | `default` | hybrid, YaRN 500k, deterministic top-k, reduced draft vocabulary, prefix caching, MTP=2 | the recommended one: best tournament score (45/51) |
 | `speed` | default + `MTP=3` | +7% decode for about one tournament point |
+| `mtp-fast` | NVIDIA hybrid, MTP3 NVFP4 proposal head, 16k batch, 13 GiB FP8 KV, 500k context | higher cold prefill and sampled throughput on the measured GB10 workloads, with higher batch memory use. [v0.33 measurements](docs/VLLM-033.md#mtp-speed-profile) |
 | `dflash` | default + the DFlash2 draft model (incoai, 0.6B) instead of the MTP head (`DRAFT_MODEL`, `MTP=0`, `DRAFT_TOKENS=4`) | code, reasoning and tool-call workloads can benefit; +26% on the tested single-request workload. Sampled long-context prose can be slower. No quality degradation observed. Higher GPU memory use; [workload measurements below](#dflash-profile). |
 | `concurrent` | default + `SEQS=16`, `MAMBA_SSM_DTYPE=bfloat16`; uses the default CPUSET `5-9,15-19` | higher aggregate throughput with parallel clients; [measured with FP8 KV and an 8 GiB pool](#measured-concurrent-profile-pr-54) |
 | `context` | `MODE=hybrid-mtp` (NVFP4 MTP draft experts) | +22% KV pool for concurrency or long contexts, decode unchanged |
@@ -368,10 +376,10 @@ to `qwen38-flash` and `18300`, like `serve.sh`.
 ### DFlash profile
 
 `./flash setup dflash` prepares the draft model and rebuilds an existing image
-when it lacks the DFlash capability label, even if it already uses vLLM v0.32.
+when it lacks the DFlash capability label, even when the base version matches.
 Images built before this check was added are rebuilt once. `doctor dflash` and
 `serve dflash` report missing support before replacing a container. A manual
-`docker build -t qwen38-flash-dgx:v0.32 .` also includes patch 23.
+`docker build -t qwen38-flash-dgx:v0.33 .` also includes patch 23.
 Start it with `./flash serve dflash`. This adds a separate profile; the existing
 profiles and default selection are unchanged.
 
@@ -1243,7 +1251,7 @@ Details: [results-radixark-vllm.md](https://github.com/jschmied/qwen38-flash-nex
 ```
 flash                             one-command front-end: doctor / setup / serve <profile> / wait / test / status …
 profiles/*.env                    named recipes (default, speed, concurrent, context, context-1m, shared, published, native)
-Dockerfile                        official vLLM v0.32.0 image + the patches below (qwen38-flash-dgx:v0.32).
+Dockerfile                        official vLLM v0.33.0 image + the patches below (qwen38-flash-dgx:v0.33).
                                      Native upstream now: 3, 7, 9, 11, 16 (docs/HISTORY.md, docs/VLLM-031.md)
 src/vllm_ple_mmap.py              1. mmap PLE table (opaque op, breaks the CUDA-graph capture)  VLLM_PLE_MMAP=1
 src/patch_mamba_block_size.py     4. prefix-caching block_size fix
@@ -1310,8 +1318,8 @@ docs/HISTORY.md                   the earlier updates and the preview / v0.29 ba
 Run the unit tests (no GPU):
 
 ```bash
-docker run --rm -v "$PWD/src:/t" -w /t --entrypoint python3 qwen38-flash-dgx:v0.32 test_ple_mmap_cpu.py
-docker run --rm -v "$PWD/src:/t" -w /t --entrypoint python3 qwen38-flash-dgx:v0.32 test_qsa_exact_topk_cpu.py
+docker run --rm -v "$PWD/src:/t" -w /t --entrypoint python3 qwen38-flash-dgx:v0.33 test_ple_mmap_cpu.py
+docker run --rm -v "$PWD/src:/t" -w /t --entrypoint python3 qwen38-flash-dgx:v0.33 test_qsa_exact_topk_cpu.py
 # test_moe_name_index_cpu.py exercises the retired local patch, not v0.31's native index.
 ```
 
@@ -1359,7 +1367,7 @@ docker run --rm -v "$PWD/src:/t" -w /t --entrypoint python3 qwen38-flash-dgx:v0.
 - NVFP4 MTP draft experts (the `hybrid-mtp` graft donor): **[Inferact/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/Inferact/Qwen3.8-Flash-Next-NVFP4)**; the graft recipe follows
   [thavoc's graft write-up](https://gist.github.com/thavoc/d7083457f6f2d981f879670c34df34ab)
   and [Peuqui/mtp-quant-transplant](https://github.com/Peuqui/mtp-quant-transplant).
-- Serving engine and base image: **vLLM** (`vllm/vllm-openai:v0.32.0`; the model's support started as
+- Serving engine and base image: **vLLM** (`vllm/vllm-openai:v0.33.0`; the model's support started as
   the `release/qwen38next` recipe / PR #53896); the Mamba state-copy race fix is
   [vllm#50729](https://github.com/vllm-project/vllm/pull/50729) by **@AndreasKaratzas**.
 - GB10 FLA fixes, the faster PLE gather, the state-copy guard and the fp8 side-layer

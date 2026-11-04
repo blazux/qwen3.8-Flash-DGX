@@ -31,7 +31,7 @@ with open(os.environ["FAKE_DOCKER_LOG"], "a") as f:
 cap = Path(os.environ["FAKE_CAP"])
 if args[:2] == ["image", "inspect"]:
     if "-f" in args:
-        print(cap.read_text() if "qwen38.dflash" in args[args.index("-f") + 1] else "v0.32")
+        print(cap.read_text() if "qwen38.dflash" in args[args.index("-f") + 1] else "v0.33")
 elif args[0] == "build":
     cap.write_text("1")
 elif args[0] == "inspect":
@@ -118,6 +118,19 @@ else:
         self.assertNotIn("", args)
         spec = json.loads(args[args.index("--speculative-config") + 1])
         self.assertEqual(spec, {"method": "mtp", "num_speculative_tokens": 2, "max_model_len": 500000})
+
+    def test_mtp_fast_uses_native_draft_quantization(self):
+        r = self.run_script("flash", "serve", "mtp-fast")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        args = next(x for x in self.calls() if x[0] == "run")
+        spec = json.loads(args[args.index("--speculative-config") + 1])
+        self.assertEqual(spec, {
+            "method": "mtp", "num_speculative_tokens": 3, "max_model_len": 500000,
+            "draft_lm_head_quantization": "nvfp4",
+        })
+        self.assertEqual(args[args.index("--max-num-batched-tokens") + 1], "16384")
+        self.assertIn("VLLM_USE_V2_MODEL_RUNNER=1", args)
+        self.assertFalse(any(arg.startswith("VLLM_MTP_DRAFT_VOCAB=") for arg in args))
 
     def test_same_base_missing_capability_rebuilds_once(self):
         self.cap.write_text("")

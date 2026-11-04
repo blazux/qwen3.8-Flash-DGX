@@ -3,9 +3,9 @@
 
     python3 src/test_dflash_patch_cpu.py
 
-Fixtures are syntactically valid windows of the v0.32.0 files around every
+Fixtures are syntactically valid windows of the v0.33.0 files around every
 anchor the patch edits (anchors copied byte-exact from
-https://github.com/vllm-project/vllm/tree/v0.32.0). Checks:
+https://github.com/vllm-project/vllm/tree/v0.33.0). Checks:
   1. the patcher runs clean and idempotent over a fake dist-packages tree;
   2. every edit landed in the right file with the right shape;
   3. a drifted anchor refuses loudly instead of half-patching;
@@ -94,7 +94,7 @@ QSA_FIXTURE = '''\
 import torch
 from vllm.config import CacheConfig, VllmConfig
 from vllm.config.cache import CacheDType
-from vllm.utils.math_utils import cdiv
+from vllm.utils.math_utils import cdiv, round_up
 
 
 def canonical_qsa_rope_positions(positions: torch.Tensor) -> torch.Tensor:
@@ -113,7 +113,7 @@ class QSAKeyStateCache(_QSAStateCache):
         # the scheduler block size). Anything narrower lets a rejected draft row
         # overwrite a committed key the next step needs to close the group.
         span = self.compress_ratio + vllm_config.num_speculative_tokens
-        capacity = self.compress_ratio * cdiv(span, self.compress_ratio)
+        capacity = round_up(span, self.compress_ratio)
         assert self.cache_config.block_size % capacity == 0, (
             f"QSA ring capacity {capacity} must divide the attention block "
             f"size {self.cache_config.block_size}"
@@ -181,8 +181,8 @@ def main() -> None:
         import logging
         logging.Logger.info_once = lambda self, *a: None  # vllm logger extension
         body = re.search(r"QSA_RING_MAX_WIDENING = 2.*?class QSAKeyStateCache", qsa, re.S).group(0)
-        ns = {"logger": logging.getLogger("qsa")}
-        exec("def cdiv(a, b):\n    return -(-a // b)\n" + body[: body.index("class QSA")], ns)
+        ns = {"logger": logging.getLogger("qsa"), "cdiv": lambda a, b: -(-a // b)}
+        exec(body[: body.index("class QSA")], ns)
         f = ns["qsa_ring_capacity"]
         for k, expect in ((1, 8), (2, 8), (3, 8), (4, 8)):  # MTP-era depths on 848
             assert f(4, k, 848) == expect, (k, f(4, k, 848))

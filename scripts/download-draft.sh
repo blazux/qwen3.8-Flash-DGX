@@ -17,7 +17,7 @@
 set -euo pipefail
 
 DRAFT_MODEL="${DRAFT_MODEL:-incoai/Qwen3.8-Flash-Next-DFlash2}"
-IMAGE="${IMAGE:-qwen38-flash-dgx:v0.32}"
+IMAGE="${IMAGE:-qwen38-flash-dgx:v0.33}"
 HF_CACHE="${HF_CACHE:-$HOME/.cache/huggingface}"
 MAX_WORKERS="${MAX_WORKERS:-8}"
 mkdir -p "$HF_CACHE"

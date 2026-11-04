@@ -2,7 +2,7 @@
 
 Originally a minimal vLLM v0.31 port of
 [Chaos2522's schema2 repair](https://github.com/blazux/qwen3.8-Flash-DGX/issues/31#issuecomment-6291191080).
-The current recipe rebases this onto v0.32; use its
+For the historical v0.32 port, use its
 [release manifest and validation](../../docs/VLLM-032.md).
 It applies after patch 19 including the issue #56 Chat compatibility follow-up.
 `SOURCE.json` records the original archive, credit and adaptations;
@@ -29,14 +29,14 @@ nine installed parser/Responses source hashes before importing the test modules;
 it does not overlay runtime source.
 
 ```bash
-docker build -t qwen38-flash-dgx:v0.32 .
+docker build -t qwen38-flash-dgx:v0.33 .
 docker run --rm --network none --runtime runc --entrypoint python3 \
   -e VLLM_TARGET_DEVICE=cpu -e CUDA_VISIBLE_DEVICES= \
   -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \
   -e QWEN_TOKENIZER=/tokenizer \
   -v "$PWD/tests:/tests:ro" \
   -v /path/to/local/tokenizer:/tokenizer:ro \
-  qwen38-flash-dgx:v0.32 /tests/issue31_schema_arguments/run_qa.py \
+  qwen38-flash-dgx:v0.33 /tests/issue31_schema_arguments/run_qa.py \
   --manifest /tests/vllm032/PORT-MANIFEST.json
 ```
 

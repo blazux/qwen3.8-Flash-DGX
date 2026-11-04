@@ -1,6 +1,6 @@
 # Issue #31: parser and Responses regression tests
 
-The current v0.32 recipe and installed-source manifest are documented in
+The historical v0.32 recipe and installed-source manifest are documented in
 [VLLM-032.md](../../docs/VLLM-032.md). The v0.31 results below remain historical.
 
 Port of [Chaos2522's review2 bundle](https://github.com/blazux/qwen3.8-Flash-DGX/issues/31#issuecomment-6191209070).
@@ -26,12 +26,12 @@ Build the candidate recipe from this branch, then provide compatible local
 Qwen tokenizer metadata. No model weights or GPU are needed for these tests.
 
 ```bash
-docker build -t qwen38-flash-dgx:v0.32 .
+docker build -t qwen38-flash-dgx:v0.33 .
 docker run --rm --network none --runtime runc --entrypoint python3 \
   -v "$PWD/tests/issue31_safe_output:/qa:ro" \
   -v /path/to/local/tokenizer:/tokenizer:ro \
   -e QWEN_TOKENIZER=/tokenizer \
-  qwen38-flash-dgx:v0.32 /qa/run_qa.py
+  qwen38-flash-dgx:v0.33 /qa/run_qa.py
 ```
 
 The runner loads installed vLLM modules without runtime source overlays and

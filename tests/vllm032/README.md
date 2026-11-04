@@ -1,4 +1,4 @@
-# vLLM v0.32 compatibility validation
+# vLLM compatibility validation
 
 The migration keeps the existing checkpoint and serving-profile settings.
 [VLLM-032.md](../../docs/VLLM-032.md) records the port decisions, GPU probes,
@@ -21,14 +21,14 @@ tests import the modules installed in the image. Provide local compatible Qwen
 tokenizer metadata; no weights, GPU, network or running inference server are used.
 
 ```bash
-docker build -t qwen38-flash-dgx:v0.32 .
+docker build -t qwen38-flash-dgx:v0.33 .
 docker run --rm --network none --runtime runc --entrypoint python3 \
   -e VLLM_TARGET_DEVICE=cpu -e CUDA_VISIBLE_DEVICES= \
   -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \
   -e QWEN_TOKENIZER=/tokenizer \
   -v "$PWD/tests:/tests:ro" \
   -v /path/to/local/tokenizer:/tokenizer:ro \
-  qwen38-flash-dgx:v0.32 /tests/vllm032/run_cpu_qa.py
+  qwen38-flash-dgx:v0.33 /tests/vllm032/run_cpu_qa.py
 ```
 
 The schema author's dotted-namespace case remains a known failure: **22/23**.

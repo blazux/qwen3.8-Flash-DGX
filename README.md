@@ -29,10 +29,12 @@ git clone https://github.com/blazux/qwen3.8-Flash-DGX.git && cd qwen3.8-Flash-DG
 ./flash test        # health, coherence, prefix-cache hit, determinism, tok/s
 ```
 
-Other recipes are one word away: `./flash profiles` lists them (`mtp-standard`, `speed`, `concurrent`, `context`, `context-1m`,
-`shared`, `published`, `native`, `dflash`), `./flash serve speed` runs one, and any variable can still
-be overridden on the command line (`./flash serve BATCH_TOKENS=8192 PORT=18301`). `./flash status`,
-`logs`, `stop`, `start`, `rm` do what they say. Details in [The `flash` command](#the-flash-command).
+Use `./flash profiles` to list the recipes. Start with the default, use
+`./flash serve shared` if ongoing responses need to stay responsive during
+long prefills, or see [Choosing a 1M-context profile](#choosing-a-1m-context-profile).
+Override individual settings with `KEY=VALUE` arguments, for example
+`./flash serve BATCH_TOKENS=8192 PORT=18301`.
+Details in [The `flash` command](#the-flash-command).
 
 To run the default profile using the scripts directly:
 
@@ -361,16 +363,30 @@ Profiles (`profiles/*.env`, each a handful of `serve.sh` variables; copy one to 
 | --- | --- | --- |
 | `default` / `mtp-fast` | NVIDIA hybrid, MTP3 NVFP4 proposal head, 16k batch, 13 GiB FP8 KV, 500k context | default on vLLM 0.33. [Performance and memory](#vllm-v033-upgrade) |
 | `mtp-standard` | NVIDIA hybrid, YaRN 500k, MTP2, reduced draft vocabulary | previous default recipe |
-| `speed` | `mtp-standard` with `MTP=3` | three speculative tokens with the reduced draft vocabulary |
 | `dflash` | `mtp-standard` + the DFlash2 draft model (incoai, 0.6B) instead of the MTP head (`DRAFT_MODEL`, `MTP=0`, `DRAFT_TOKENS=4`) | code, reasoning and tool-call workloads can benefit; +26% on the tested single-request workload. Sampled long-context prose can be slower. No quality degradation observed. Higher GPU memory use; [workload measurements below](#dflash-profile). |
-| `concurrent` | `mtp-standard` + `SEQS=16`, `MAMBA_SSM_DTYPE=bfloat16`; uses the default CPUSET `5-9,15-19` | higher aggregate throughput with parallel clients; [measured with FP8 KV and an 8 GiB pool](#measured-concurrent-profile-pr-54) |
-| `context` | `MODE=hybrid-mtp` (NVFP4 MTP draft experts) | +22% KV pool for concurrency or long contexts, decode unchanged |
-| `context-1m` | hybrid + `KV_DTYPE=fp8_e4m3`, 1M context | when you need 1M tokens in one request (small speed cost) |
+| `radixark-graft` | RadixArk NVFP4 with the NVFP4 MTP draft-experts graft | Use with a prepared RadixArk checkpoint. `context` is an alias. |
 | `dflash-1m` | DFlash2 K4, 1M context, BF16 recurrent state, 21 GiB fixed FP8 KV | faster single-stream decoding. [Compare 1M profiles](#choosing-a-1m-context-profile) |
 | `mtp4-1m` | MTP4, full draft vocabulary, same 1M context and cache budget | matched reference with more KV capacity at the same memory budget |
-| `shared` | `mtp-standard` + `--long-prefill-token-threshold 1024` | several clients at once: decoding stays responsive while others prefill, single-stream TTFT −17–36% |
-| `published` | `MODE=nvfp4`, YaRN 500k | the checkpoint exactly as published, nothing to prepare; ~26 tok/s |
+| `shared` | `mtp-standard` with a 1,024-token long-prefill threshold | Shorter pauses in ongoing streams at the cost of a slower concurrent prefill. |
+| `published` | NVIDIA NVFP4 checkpoint as published, YaRN 500k | No hybrid conversion. Automatic KV sizing can be tight at 500k. |
 | `native` | hybrid, 262k, no YaRN | if you never go past the native context |
+
+The earlier MTP recipes remain available for existing commands.
+
+| Compatibility profile | Equivalent invocation | When to use it |
+| --- | --- | --- |
+| `speed` | `./flash serve mtp-standard MTP=3` | Similar throughput to MTP2 on the tested sampled workloads. |
+| `concurrent` | `./flash serve mtp-standard SEQS=16 MAMBA_SSM_DTYPE=bfloat16` | Similar throughput to `mtp-fast` at eight concurrent requests in the 0.33 check. |
+| `context-1m` | `./flash serve mtp-standard CTX=1000000 KV_DTYPE=fp8_e4m3` | MTP2 with automatic KV sizing. See the two measured 1M profiles for fixed-budget comparisons. |
+
+On the GX10 with vLLM 0.33, `shared` reduced the longest median pause
+during an ongoing decode from 2.63 s to 0.48 s versus `mtp-standard` in
+a three-repeat test with a concurrent 52k prompt. The long prompt's median
+time to first token increased from 17.2 s to 29.1 s.
+
+The `published` profile passed the smoke check after two automatic restarts.
+On the first two attempts vLLM estimated capacity at roughly 490k tokens.
+If startup reports a KV shortage, lower `CTX` below the ceiling in the log.
 
 Precedence: a variable already in your environment beats the profile (`PORT=18301 ./flash serve`
 works like the plain scripts), and `KEY=VALUE` arguments beat both. Container name and port default

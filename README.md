@@ -137,4 +137,5 @@ With `published`, lower `CTX` if the engine reports a smaller KV ceiling.
 - [How it works](docs/HOW-IT-WORKS.md) for PLE offload, hybrid weights and GB10 patches.
 - [Tool calling and Responses](docs/SAFE-OUTPUT.md) for parser behavior and validation.
 - [Project history](docs/HISTORY.md) for previous releases and benchmarks.
+- [Archived README](docs/README-ARCHIVE.md) for the full documentation before the rewrite.
 - [Credits](docs/SERVING.md#credits) and [Apache-2.0 license](LICENSE). The model weights have their own license.

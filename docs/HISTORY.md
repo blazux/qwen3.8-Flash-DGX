@@ -1,5 +1,7 @@
 # History
 
+The [archived full README](https://github.com/blazux/qwen3.8-Flash-DGX/blob/383e1f975b4ce9eed3f2e5d6d923d37d54c5c0e1/README.md) records earlier release notes and benchmark tables.
+
 What the README said about each release of this recipe, kept as it was written. Until 2026-09-28 the
 repo supported three base images: the Qwen3.8-Flash-Next preview image (`Dockerfile`), vLLM v0.29.0
 (`Dockerfile.v0.29`) and vLLM v0.30.0 (`Dockerfile.v0.30`). Since then vLLM v0.30.0 is the only base.
@@ -39,7 +41,7 @@ profiles, `PAD_M4`, patches 3, 9 and 11) are at the git tag
   This was the last patch missing on v0.30.
 - **Determinism is sequential** ([#32](https://github.com/blazux/qwen3.8-Flash-DGX/issues/32)): the
   same request repeated one at a time is byte-identical; concurrent requests are not batch-invariant,
-  a vLLM limit for GDN models. Scope added to [Deterministic top-k](../README.md#deterministic-top-k-det_topk1-default).
+  a vLLM limit for GDN models. Scope added to [Deterministic top-k](https://github.com/blazux/qwen3.8-Flash-DGX/blob/383e1f975b4ce9eed3f2e5d6d923d37d54c5c0e1/README.md#deterministic-top-k-det_topk1-default).
 
 ## Update 2026-09-14 — NVIDIA's checkpoint is the default
 
@@ -55,7 +57,7 @@ profiles, `PAD_M4`, patches 3, 9 and 11) are at the git tag
   on both; KV pool +15% on that boot (679k vs 589k tokens, +22% on another); single-stream decode −7 to
   −8% (34.5 vs 37.1 tok/s), equal under load. The default rule of this repo is quality first: at parity
   or better, the checkpoint with more KV room and the vendor's own export wins. Numbers, protocol and
-  the honest caveats: [Checkpoints](../README.md#checkpoints-nvidias-nvfp4-default-and-radixarks).
+  the honest caveats: [Checkpoints](https://github.com/blazux/qwen3.8-Flash-DGX/blob/383e1f975b4ce9eed3f2e5d6d923d37d54c5c0e1/README.md#checkpoints-nvidias-nvfp4-default-and-radixarks).
 - **What it costs you**: ~3 tok/s of single-stream decode against RadixArk, and a 124 GiB download in
   24 files, one of them 50 GiB, that only comes through Xet (the default of `download-weights.sh`
   since PR #19). On the v0.29 image the fp8 MTP drafter loads through the vllm#55513 backport; on the
@@ -99,16 +101,16 @@ Newest first. If you cloned this before, this is the short version; details in t
   RadixArk at equal recipe: **quality at parity, needle 6/6 on both up to 413k, decode 34.0 vs 36.4 tok/s,
   KV pool +22–28% (721k tokens)**. The default stayed RadixArk that day; the 5-pass head-to-head of
   the next night made NVIDIA the default (see the 2026-09-14 update above).
-  → [Checkpoints](../README.md#checkpoints-nvidias-nvfp4-default-and-radixarks)
+  → [Checkpoints](https://github.com/blazux/qwen3.8-Flash-DGX/blob/383e1f975b4ce9eed3f2e5d6d923d37d54c5c0e1/README.md#checkpoints-nvidias-nvfp4-default-and-radixarks)
 - **Download knobs, PLE counters, `KV_CACHE_MEM`** — [@techfury90](https://github.com/techfury90)'s PR #19:
   `XET`/`EXCLUDE`/`MAX_WORKERS` for `download-weights.sh`, five `vllm:ple_mmap_*` Prometheus counters
   (opt-in export with `PROM_MULTIPROC=1`), and `KV_CACHE_MEM` for an explicit KV budget. All verified live.
   We flipped **Xet on by default** right after: the Hub no longer serves files over 50 GB through the plain
-  path, and NVIDIA's PLE table is one 50 GiB shard. → [Watching the mmapped table](../README.md#watching-the-mmapped-table-vllmple_mmap_)
+  path, and NVIDIA's PLE table is one 50 GiB shard. → [Watching the mmapped table](https://github.com/blazux/qwen3.8-Flash-DGX/blob/383e1f975b4ce9eed3f2e5d6d923d37d54c5c0e1/README.md#watching-the-mmapped-table-vllmple_mmap_)
 - **`COMPILE_CACHE`** — [@AronRubin](https://github.com/AronRubin)'s PR #21 keeps vLLM's compiled graphs in
   docker volumes across boots: **init engine 122 s → 41 s** on our box (compilation 34 s → 0.5 s), outputs
   identical. Opt-in; worth it whenever something recreates the container for you.
-  → [Persistent compile cache](../README.md#optional-persistent-compile-cache-compile_cache)
+  → [Persistent compile cache](https://github.com/blazux/qwen3.8-Flash-DGX/blob/383e1f975b4ce9eed3f2e5d6d923d37d54c5c0e1/README.md#optional-persistent-compile-cache-compile_cache)
 - `./flash doctor` now reports a checkpoint as **incomplete** when a shard named by the index is missing
   (an interrupted download leaves dangling symlinks and everything looks present).
 
@@ -152,12 +154,12 @@ Newest first. If you cloned this before, this is the short version; details in t
   (+23%)**. Idea taken from [MiaAI-Lab's recipe](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark),
   reimplemented here (their code is AGPL). Same source for the `MADV_RANDOM` advice on the
   mmapped table, now on by default (no readahead: cold prefill −4–8%, cleaner page cache, a
-  slightly larger KV pool). → [Reduced draft vocabulary](../README.md#reduced-draft-vocabulary-draft_vocab1-default)
+  slightly larger KV pool). → [Reduced draft vocabulary](https://github.com/blazux/qwen3.8-Flash-DGX/blob/383e1f975b4ce9eed3f2e5d6d923d37d54c5c0e1/README.md#reduced-draft-vocabulary-draft_vocab1-default)
 - **`MODE=hybrid-mtp`** — [@pfy](https://github.com/pfy)'s graft of Inferact's NVFP4 MTP draft
   experts onto the hybrid checkpoint (PR #11): −3.9 GiB of weights, **+22% KV pool**. On our box
   decode is unchanged (the cheaper draft is accepted less often) and the tournament is neutral
   (44/51), so it ships as an option for people who need context or concurrency more than the
-  last percent of quality. → [NVFP4 MTP draft experts](../README.md#nvfp4-mtp-draft-experts-modehybrid-mtp-radixark-only)
+  last percent of quality. → [NVFP4 MTP draft experts](https://github.com/blazux/qwen3.8-Flash-DGX/blob/383e1f975b4ce9eed3f2e5d6d923d37d54c5c0e1/README.md#nvfp4-mtp-draft-experts-modehybrid-mtp-radixark-only)
 - Full same-day comparison behind those choices (all hybrid, MTP=2, prefix caching, YaRN 500k):
   exact `torch.topk` 43/51 @31.4 tok/s → deterministic kernel 44/51 @31.9 → `MADV_RANDOM` 44.5/51 @33.5 →
   **reduced draft vocabulary 45/51 @38.5 (default)** → same with MTP=3 44/51 @41.2 (option) → `hybrid-mtp` 44/51 @33.0, KV +22% (option).
@@ -173,7 +175,7 @@ Newest first. If you cloned this before, this is the short version; details in t
   (32k: 1,794 → 2,996 tok/s). `DET_TOPK=1` is the default; `EXACT_TOPK=1` stays as a fallback.
   Kernel pin bumped 2026-09-07 (PR #10): signed-zero fix, low-shared-memory path, a launcher bug
   that would have crashed some long-context widths, and a faster kernel.
-  → [Deterministic top-k](../README.md#deterministic-top-k-det_topk1-default)
+  → [Deterministic top-k](https://github.com/blazux/qwen3.8-Flash-DGX/blob/383e1f975b4ce9eed3f2e5d6d923d37d54c5c0e1/README.md#deterministic-top-k-det_topk1-default)
 
 **2026-08-29 → 2026-09-07**:
 
@@ -185,7 +187,7 @@ Newest first. If you cloned this before, this is the short version; details in t
   attempt to reproduce it, which sharpened the write-up.
   `PREFIX_CACHE=1` is the new default. Repeated prefixes (system prompts, multi-turn,
   tool loops) skip the prefill: ~14 s → ~1.4 s TTFT on a 20k-token prefix.
-  → [Prefix caching now works](../README.md#prefix-caching-now-works-and-why-it-didnt)
+  → [Prefix caching now works](https://github.com/blazux/qwen3.8-Flash-DGX/blob/383e1f975b4ce9eed3f2e5d6d923d37d54c5c0e1/README.md#prefix-caching-now-works-and-why-it-didnt)
 - **Optional M%4 padding for the fp8 GEMM** (`PAD_M4=1`, hybrid mode) — the image's blockwise-fp8
   kernel is up to 10× slower on chunks whose row count is not a multiple of 4; the padding is
   [@jschmied](https://github.com/jschmied)'s. With prefix caching on (default) chunks are already
@@ -195,7 +197,7 @@ Newest first. If you cloned this before, this is the short version; details in t
   [@kutovoy](https://github.com/kutovoy) (issue #9), reproduced and measured: it is vLLM's
   chunked prefill (one decode token per 3–7 s step while a new prompt is being prefilled), not a
   bug. `EXTRA='--long-prefill-token-threshold 1024'` trades single-stream TTFT for
-  responsiveness; numbers and guidance in [the concurrency section](../README.md#decoding-clients-stall-while-other-clients-prefill-the-long-prefill-token-threshold-slider).
+  responsiveness; numbers and guidance in [the concurrency section](https://github.com/blazux/qwen3.8-Flash-DGX/blob/383e1f975b4ce9eed3f2e5d6d923d37d54c5c0e1/README.md#decoding-clients-stall-while-other-clients-prefill-the-long-prefill-token-threshold-slider).
 - **Audit fixes** — [@sternnick](https://github.com/sternnick) audited the repo line by line
   against their own Spark (issue #8). Taken so far: the files fetched from @jschmied's repo are
   pinned by sha256 as well as by commit (and that repo is Apache-2.0 now), the fp8-KV guard only
@@ -210,7 +212,7 @@ Newest first. If you cloned this before, this is the short version; details in t
   + fp8 side layers, one-time `scripts/prepare-hybrid.sh`): **+20% decode, +8% KV,
   same quality**. Our box runs the hybrid. The fp8 side-layer conversion and the
   original int4+fp8 dispatch it is ported from are
-  [@Saren-Arterius](https://github.com/Saren-Arterius)'s. → [Two checkpoint modes](../README.md#two-checkpoint-modes-nvfp4-or-hybrid)
+  [@Saren-Arterius](https://github.com/Saren-Arterius)'s. → [Two checkpoint modes](https://github.com/blazux/qwen3.8-Flash-DGX/blob/383e1f975b4ce9eed3f2e5d6d923d37d54c5c0e1/README.md#two-checkpoint-modes-nvfp4-or-hybrid)
 - **Also in the image**: vllm#50729 (Mamba state-copy race, by
   [@AndreasKaratzas](https://github.com/AndreasKaratzas)) + a bounds guard, the GB10 FLA
   fixes and the faster PLE gather from [@Saren-Arterius](https://github.com/Saren-Arterius)'s fork.

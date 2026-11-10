@@ -4,6 +4,7 @@
 Measures client-observed TTFT, inter-token decode rate, and cached tokens.
 Unique seeded prompts avoid accidental prefix reuse; each is repeated once.
 Does not clear server caches or force generation past EOS.
+Rejects incomplete/error streams and refuses to overwrite earlier results.
 """
 import argparse
 import concurrent.futures
@@ -22,12 +23,21 @@ def request(base, body):
     first = last = None
     text = ""
     usage = {}
+    finish_reason = None
+    done = False
     with urllib.request.urlopen(req, timeout=120) as response:
         for raw in response:
-            if not raw.startswith(b"data: ") or raw.strip() == b"data: [DONE]":
+            if not raw.startswith(b"data: "):
                 continue
+            if raw.strip() == b"data: [DONE]":
+                done = True
+                break
             chunk = json.loads(raw[6:])
+            if chunk.get("error"):
+                raise RuntimeError(f"stream error: {chunk['error']}")
             for choice in chunk.get("choices", []):
+                if choice.get("finish_reason") is not None:
+                    finish_reason = choice["finish_reason"]
                 delta = choice.get("delta", {})
                 part = (delta.get("reasoning_content") or delta.get("reasoning") or "") + (delta.get("content") or "")
                 if part:
@@ -38,13 +48,19 @@ def request(base, body):
             if chunk.get("usage"):
                 usage = chunk["usage"]
     end = time.perf_counter()
-    tokens = usage.get("completion_tokens", 0)
+    # HTTP 200 and EOF do not establish a successful generation. An engine can
+    # terminate the stream after some text, or report an error inside SSE.
+    if not done or finish_reason is None or not usage:
+        raise RuntimeError("incomplete stream: expected finish_reason, usage and [DONE]")
+    tokens = usage.get("completion_tokens")
+    if type(tokens) is not int or tokens < 0:
+        raise RuntimeError("invalid stream usage: completion_tokens must be a non-negative integer")
     return {
         "ttft_s": first - start if first else None,
         "elapsed_s": end - start,
         "decode_tokens_per_s": (tokens - 1) / (last - first)
         if tokens > 1 and last and last > first else None,
-        "usage": usage, "text": text,
+        "usage": usage, "text": text, "finish_reason": finish_reason,
     }
 
 
@@ -54,7 +70,7 @@ def main():
     parser.add_argument("--seconds", type=int, default=600)
     parser.add_argument("--seed", type=int, default=3100)
     parser.add_argument("--label", required=True)
-    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True, help="New JSONL file; must not already exist")
     args = parser.parse_args()
     base = args.base_url.rstrip("/")
     with urllib.request.urlopen(base + "/v1/models", timeout=10) as response:
@@ -62,7 +78,7 @@ def main():
     args.output.parent.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
     words = "ledger invoice payroll contract clause annex schedule amount date vendor total net gross tax due paid".split()
-    with args.output.open("w") as out:
+    with args.output.open("x") as out:
         def emit(row):
             row.update(label=args.label, model=model, seed=args.seed)
             out.write(json.dumps(row) + "\n")

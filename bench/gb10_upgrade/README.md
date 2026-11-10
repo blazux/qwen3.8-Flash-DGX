@@ -18,6 +18,12 @@ run `harness/bench_swe_micro.py` directly with `--image IMAGE` and the settings
 in the protocol. Repair execution uses no host mounts, a read-only root,
 network isolation and explicit memory/CPU/PID limits.
 
+Retrieval runs sequentially, one request per declared document position, with
+a 64-token output cap in `needles()`. Shared CLI metadata also prints the generic
+`output_tokens` and `concurrencies` argument defaults in needle mode; those
+fields do not control retrieval requests. Interpret them together with `mode`
+and the frozen request generator, rather than as concurrent full-context load.
+
 ## HumanEval+
 
 HumanEval+ is a separate stage. The measurements reuse a local Python 3.12

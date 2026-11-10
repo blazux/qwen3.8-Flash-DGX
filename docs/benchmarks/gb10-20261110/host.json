@@ -1,0 +1,13 @@
+{
+  "observed_utc": "2026-11-10T18:48:34.709569+00:00",
+  "platform": "Lenovo GB10, 128 GB unified memory",
+  "machine": "aarch64",
+  "kernel": "6.17.0-1021-nvidia",
+  "logical_cpus": 20,
+  "memory_total_kib": 127535272,
+  "swap_total_kib": 16777212,
+  "gpu": "NVIDIA GB10, 595.84",
+  "base_arm64_manifest": "sha256:e3481489818d3e563cae517b84ab959cc8b69f85a9fbb771c189140131ffc65c",
+  "evalplus_commit": "26d6d00bb1fd0fa37f39c99d5290da67891d1c5e",
+  "evalplus_dataset_hash": "fe585eb4df8c88d844eeb463ea4d0302"
+}

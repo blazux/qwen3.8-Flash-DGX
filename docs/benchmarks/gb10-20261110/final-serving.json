@@ -1,0 +1,35 @@
+{
+  "observed_utc": "2026-11-10T21:04:19.731009+00:00",
+  "serving_recipe": "v033-matched",
+  "api_version": "0.33.0",
+  "model": "qwen3.8-flash-next",
+  "image": "qwen38-flash-dgx:v0.33",
+  "image_id": "sha256:a7e375d49ab6f0908ad31670540a512fd3a5d82fa975c9fa502929b797b445e1",
+  "container_started_at": "2026-11-10T20:58:03.911590745Z",
+  "running": true,
+  "restart_count": 0,
+  "oom_killed": false,
+  "cpuset_cpus": "",
+  "command_matches_measured_recipe": true,
+  "configuration_matches_measured_recipe": true,
+  "kv_pool_tokens_on_final_boot": 625748,
+  "streaming_client": {
+    "passed": true,
+    "finish_reason": "stop",
+    "completion_tokens": 2,
+    "text_sha256": "c2e3ac47f4a325469c1a2d5f117e463ec943c721986d5d9f09ac4540b7d80526"
+  },
+  "application_network": {
+    "passed": true,
+    "models_status": 200,
+    "generation_status": 200,
+    "content": "READY",
+    "finish_reason": "stop"
+  },
+  "prior_runtime_finished_at": "2026-11-10T20:58:03.6452264Z",
+  "driver_messages_since_final_boot": {
+    "nv_err_no_memory_messages": 0,
+    "xid_messages": 0,
+    "other_nvrm_messages": 0
+  }
+}

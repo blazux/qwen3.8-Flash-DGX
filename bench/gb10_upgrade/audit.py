@@ -91,6 +91,18 @@ def main():
             candidate = identities(label, filename, kind)
             pairs[label][kind] = dict(reference_count=len(reference), candidate_count=len(candidate),
                 identical=bool(reference) and reference == candidate)
+        def outcomes(name):
+            f = a.root / name / 'humaneval/evaluation/evaluation.json'
+            data = json.loads(f.read_text()).get('eval', {}) if f.exists() else {}
+            return {k:(v[0]['base_status'] == 'pass',
+                       v[0]['base_status'] == v[0]['plus_status'] == 'pass') for k,v in data.items()}
+        reference = outcomes(LABELS[0])
+        candidate = outcomes(label)
+        common = sorted(reference.keys() & candidate.keys(), key=lambda k:int(k.split('/')[-1]))
+        pairs[label]['outcome_changes'] = {
+            name:dict(gained=[k for k in common if not reference[k][index] and candidate[k][index]],
+                      lost=[k for k in common if reference[k][index] and not candidate[k][index]])
+            for index,name in enumerate(('base','plus'))}
     result['paired_prompts'] = pairs
     if a.output:
         a.output.write_text(json.dumps(result, indent=2) + '\n')

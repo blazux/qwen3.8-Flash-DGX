@@ -65,6 +65,8 @@ def arm(folder):
         tools=dict(passed=sum(r.get('passed', False) for r in tools), total=len(tools),
             complete=len(tools) == 6 and {(r['case'],r['repetition']) for r in tools} == set(itertools.product(('tool','json'), range(3)))),
         repair=dict(passed=sum(r['passed'] for r in repair), total=len(repair),
+            complete=len(repair) == 6 and {(r['task'],r['repetition']) for r in repair} ==
+                {(name,0) for name in ('atomic-ledger','deep-config','retry-boundary','stable-dag','ttl-cache','window-split')},
             attempts=[{k:r.get(k) for k in ('task','repetition','passed','elapsed_s','tool_calls','tool_errors','error')} for r in repair]),
         needles=dict(passed=sum(r['passed'] for r in needles), total=len(needles),
             complete=len(needles) == 9 and {(r['target_input_tokens'],r['position']) for r in needles} == set(itertools.product((32768,131072,262144),(.1,.5,.9)))),

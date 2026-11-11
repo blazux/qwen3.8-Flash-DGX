@@ -134,6 +134,8 @@ With `published`, lower `CTX` if the engine reports a smaller KV ceiling.
 
 - [Serving reference](docs/SERVING.md) for the full profile list, tuning, TLS, diagnostics and benchmarks.
 - [vLLM 0.33](docs/VLLM-033.md) for upgrade details and measured workloads.
+- [GB10 0.31 to 0.33 comparison](docs/GB10-031-033-20261110.md) for paired
+  deployment results and raw data.
 - [How it works](docs/HOW-IT-WORKS.md) for PLE offload, hybrid weights and GB10 patches.
 - [Tool calling and Responses](docs/SAFE-OUTPUT.md) for parser behavior and validation.
 - [Project history](docs/HISTORY.md) for previous releases and benchmarks.

@@ -1,0 +1,14 @@
+{
+  "image": "qwen38-flash-dgx:v0.33",
+  "image_id": "sha256:a7e375d49ab6f0908ad31670540a512fd3a5d82fa975c9fa502929b797b445e1",
+  "cpuset_cpus": "5-9,15-19",
+  "started_at": "2026-11-10T20:02:19.961233734Z",
+  "restart_count": 0,
+  "oom_killed": false,
+  "kv_pool_tokens": 909509,
+  "driver_messages_during_runtime": {
+    "nv_err_no_memory_messages": 1,
+    "xid_messages": 0,
+    "other_nvrm_messages": 0
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "exported_utc": "2026-11-10T21:16:05.444259+00:00",
+  "upstream_serving_commit": "d5e0cbd17d2789c045ce9eaa756fe4bcb9002b3b",
+  "baseline_checkout_commit": "5484570ac87bef15442caa6c9683281fe853a243",
+  "excluded": "Private Docker inspect, startup logs, full reasoning text, repair transcripts and final repair files.",
+  "note": "Public raw.jsonl retains final answers; samples.jsonl permits independent re-evaluation."
+}

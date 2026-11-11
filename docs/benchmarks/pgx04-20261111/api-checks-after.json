@@ -1,0 +1,178 @@
+{
+  "chat": {
+    "id": "chatcmpl-9717ef1db4c4fd6f",
+    "object": "chat.completion",
+    "created": 1794407640,
+    "model": "qwen3.8-flash-next",
+    "choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "READY",
+          "refusal": null,
+          "annotations": null,
+          "audio": null,
+          "function_call": null,
+          "reasoning": null
+        },
+        "logprobs": null,
+        "finish_reason": "stop",
+        "stop_reason": null,
+        "token_ids": null,
+        "routed_experts": null,
+        "weight_versions": null
+      }
+    ],
+    "service_tier": null,
+    "system_fingerprint": "vllm-0.33.0-afbe7b47",
+    "usage": {
+      "prompt_tokens": 19,
+      "total_tokens": 21,
+      "completion_tokens": 2,
+      "prompt_tokens_details": {
+        "cached_tokens": 0,
+        "created_cache_tokens": 0,
+        "multimodal_tokens": null
+      },
+      "completion_tokens_details": {
+        "reasoning_tokens": 0
+      }
+    },
+    "prompt_logprobs": null,
+    "prompt_token_ids": null,
+    "prompt_text": null,
+    "kv_transfer_params": null,
+    "ec_transfer_params": null,
+    "metrics": null
+  },
+  "tool": {
+    "id": "chatcmpl-8164756065d53914",
+    "object": "chat.completion",
+    "created": 1794407640,
+    "model": "qwen3.8-flash-next",
+    "choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": null,
+          "refusal": null,
+          "annotations": null,
+          "audio": null,
+          "function_call": null,
+          "tool_calls": [
+            {
+              "id": "chatcmpl-tool-98f199e0dcfe36e9",
+              "type": "function",
+              "function": {
+                "name": "echo",
+                "arguments": "{\"text\": \"READY\"}"
+              }
+            }
+          ],
+          "reasoning": null
+        },
+        "logprobs": null,
+        "finish_reason": "tool_calls",
+        "stop_reason": null,
+        "token_ids": null,
+        "routed_experts": null,
+        "weight_versions": null
+      }
+    ],
+    "service_tier": null,
+    "system_fingerprint": "vllm-0.33.0-afbe7b47",
+    "usage": {
+      "prompt_tokens": 282,
+      "total_tokens": 307,
+      "completion_tokens": 25,
+      "prompt_tokens_details": {
+        "cached_tokens": 0,
+        "created_cache_tokens": 0,
+        "multimodal_tokens": null
+      },
+      "completion_tokens_details": {
+        "reasoning_tokens": 0
+      }
+    },
+    "prompt_logprobs": null,
+    "prompt_token_ids": null,
+    "prompt_text": null,
+    "kv_transfer_params": null,
+    "ec_transfer_params": null,
+    "metrics": null
+  },
+  "responses": {
+    "id": "resp_bcad40df6f92dac7",
+    "created_at": 1794407641,
+    "error": null,
+    "incomplete_details": null,
+    "instructions": null,
+    "metadata": null,
+    "model": "qwen3.8-flash-next",
+    "object": "response",
+    "output": [
+      {
+        "id": "msg_887aae08e7eac0f9",
+        "content": [
+          {
+            "annotations": [],
+            "text": "READY",
+            "type": "output_text",
+            "logprobs": null
+          }
+        ],
+        "role": "assistant",
+        "status": "completed",
+        "type": "message",
+        "phase": null
+      }
+    ],
+    "parallel_tool_calls": true,
+    "temperature": 0.0,
+    "tool_choice": "none",
+    "tools": [],
+    "top_p": 1.0,
+    "background": false,
+    "max_output_tokens": 128,
+    "max_tool_calls": null,
+    "previous_response_id": null,
+    "prompt": null,
+    "prompt_cache_options": null,
+    "prompt_cache_key": null,
+    "prompt_cache_retention": null,
+    "reasoning": null,
+    "safety_identifier": null,
+    "service_tier": "auto",
+    "status": "completed",
+    "text": null,
+    "top_logprobs": null,
+    "truncation": "disabled",
+    "usage": {
+      "input_tokens": 19,
+      "input_tokens_details": {
+        "cached_tokens": 0,
+        "cache_write_tokens": 0,
+        "input_tokens_per_turn": [],
+        "cached_tokens_per_turn": []
+      },
+      "output_tokens": 2,
+      "output_tokens_details": {
+        "reasoning_tokens": 0,
+        "tool_output_tokens": 0,
+        "output_tokens_per_turn": [],
+        "tool_output_tokens_per_turn": []
+      },
+      "total_tokens": 21
+    },
+    "user": null,
+    "presence_penalty": 0.0,
+    "frequency_penalty": 0.0,
+    "kv_transfer_params": null,
+    "ec_transfer_params": null,
+    "input_messages": null,
+    "output_messages": null
+  },
+  "all_passed": true
+}

@@ -1,0 +1,75 @@
+pgx04: Lenovo GB10 vLLM 0.32 deployment to 0.33 mtp-fast
+Measured 2026-11-11. Draft contribution by mercant1982.
+
+This is a separate machine from pgx02, which is documented in PR #68.
+This report compares the existing production recipe with the new default
+recipe. It cannot isolate the effect of the vLLM version.
+
+Hardware: Lenovo product 30KL0004GF, NVIDIA GB10, 128 GB memory class,
+driver 580.159.03. Both arms use NVIDIA hybrid checkpoint revision
+fc694b54fb0174e0913e6adf86691ef85a4ead47, 500000 context limit.
+
+Before: qwen38-flash-dgx:v0.32; MTP2, eight sequences, 8192-token batch,
+automatic/BF16 KV, reduced draft vocabulary, CPU cores 5-9,15-19.
+After: upstream d5e0cbd mtp-fast; vLLM 0.33, MTP3 with NVFP4 proposal
+head, 16 sequences, 16384-token batch, fixed 13 GiB FP8 KV, BF16 recurrent
+state, full draft vocabulary. See exact environment files for all arguments.
+
+Method: frozen tools/bench_serving.py from PR #67 commit fca7cf0,
+180 seconds per arm, seed 4111, temperature 0, thinking explicitly off,
+maximum 256 output tokens. Complete SSE streams, terminal finish reasons
+and usage are required. Tokens come from usage, not stream-event counts.
+Hermes was idle and stopped for measurement; other application containers
+were left running. See protocol.txt for the full pre-recorded protocol.
+
+Median client-observed measurements:
+Workload | Before | After | Change | Samples before/after
+~8k fresh prompt/TTFT estimate (tok/s) | 2978 | 3322 | +11.6% | 4/4
+~8k fresh TTFT (seconds) | 2.65 | 2.37 | -10.5% | 4/4
+~8k fresh output/end-to-end (tok/s) | 28.85 | 29.38 | +1.8% | 4/4
+~8k repeat TTFT (seconds) | 1.14 | 0.55 | -51.6% | 4/4
+~31k fresh prompt/TTFT estimate (tok/s) | 3082 | 3292 | +6.8% | 4/4
+~31k fresh TTFT (seconds) | 10.17 | 9.53 | -6.3% | 4/4
+~31k fresh output/end-to-end (tok/s) | 14.96 | 14.03 | -6.2% | 4/4
+~31k repeat TTFT (seconds) | 1.03 | 0.64 | -38.1% | 4/4
+Four-request shared-prefix aggregate (tok/s) | 117.67 | 99.15 | -15.7% | 3/3
+
+Fresh samples all reported cached_tokens=0. Repeat cache counts and output
+lengths are in summary.json. prompt_tokens/TTFT includes tokenization,
+scheduling and first-token work; it is not pure device prefill throughput.
+The concurrent cell shares a prompt and measures warm/shared-prefix output,
+not unique-context capacity. The fixed-time client can collect unequal counts.
+
+Completion limits:
+Before: 16 recorded single-request samples; 12 reached the output cap.
+Before: repeated greedy text identical in 8/8 fresh/repeat pairs.
+After: 16 recorded single-request samples; 11 reached the output cap.
+After: repeated greedy text identical in 0/8 fresh/repeat pairs.
+
+Limits: one measured server lifetime per arm, sequential order. Baseline
+had run for weeks; the new server was
+freshly started. No ABBA schedule or statistical significance claim. The
+repository reports about 8% boot-to-boot single-stream variance. These
+short synthetic results do not establish quality, 500k retrieval capacity
+or long-running production stability. Output-cap samples are throughput
+observations and must not be interpreted as quality failures.
+
+Startup deviation: a pre-existing system service was still pinned to the old
+image and removed the first new container during weight loading. Its restart
+hook also cleared clean filesystem cache after the baseline. The service was
+stopped and updated, and v0.33 was started again before the measured after arm.
+Thus OS-cache/swap conditions were not matched. This was an orchestration
+incident, not a measured model failure. See startup-incident.txt.
+
+Validation: see smoke-after.txt and api-checks-after.json. This report
+contains no HumanEval, long-context quality or multimodal quality claim.
+The upstream smoke test reports non-identical first-token logprobs on the
+new profile. Repeated greedy text differences are retained above; bitwise
+determinism is not established. The cause was not isolated by this short run.
+
+Reproduce on each idle serving arm:
+python3 bench_serving-integrity.py --seconds 180 --seed 4111 --label ARM --output NEW.jsonl
+python3 summarize.py
+
+Files include frozen client, raw results, protocol, sanitized serving arguments,
+hardware information, validation and checksums. No credentials or Hermes history.

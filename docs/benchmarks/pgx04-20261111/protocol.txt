@@ -1,0 +1,33 @@
+Frozen quick-upgrade protocol, 2026-11-11
+
+Hardware: Lenovo GB10, 128 GB unified-memory class; driver 580.159.03.
+Checkpoint: existing NVIDIA Qwen3.8-Flash-Next-NVFP4 hybrid, same revision in both arms.
+Arm A: preserved production qwen38-flash-dgx:v0.32 configuration.
+Arm B: upstream d5e0cbd vLLM 0.33 mtp-fast profile.
+This is a recipe upgrade, not an isolated version comparison.
+
+Run only when Hermes active_agents=0 and vLLM running/waiting=0.
+Stop the Hermes gateway for measurement and container switching; restore afterwards.
+Other application containers remain running. Record this as a shared-host limitation.
+Do not drop OS page caches, restart the host, or stop unrelated applications.
+Preserve old container and image for rollback; retain loopback-only API publication.
+
+Use tools/bench_serving.py from PR 67 commit fca7cf0005912d8b73a2297073241743c243a1c9,
+frozen as bench_serving-integrity.py, unmodified. Duration 180 s per arm, seed 4111.
+Temperature zero, enable_thinking=false, 256 output token cap, 1600/6400 generated
+word prompts (roughly 8k/31k tokens), fresh/repeat pairs, four concurrent requests.
+Validate finish_reason, usage and final SSE DONE through the corrected client.
+Store output cap hits separately; make no quality or pass@1 claim.
+The timed loop can produce different sample counts per arm; report all counts.
+The concurrency cell uses a shared prompt: it measures warm/shared-prefix output
+throughput, not unique-context capacity. Cache timing remains separate from fresh prefill.
+Report prompt_tokens / TTFT as an approximation, not pure GPU prefill throughput.
+The client's decode rate uses completion_tokens and streaming first/last event times;
+speculative multi-token chunks make this an approximate client-observed metric.
+No ABBA boots: do not treat small differences as proven gains; repo notes ~8% boot variance.
+
+Before version switch: run corrected baseline after the image build completes.
+After switch: readiness, upstream smoke test, basic tool-call/Responses checks,
+then corrected 180 s benchmark with matching seed. Retain raw JSONL and exact arguments.
+Prepare a reviewed, allowlisted result bundle. Exclude Docker inspect private environment,
+credentials, Hermes transcripts and private host/application data.

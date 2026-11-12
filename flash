@@ -39,6 +39,12 @@ run()  { if [ "$DRY" = 1 ]; then printf '  %s$ %s%s\n' "$c_dim" "$*" "$c_off"; e
 WARNINGS=0; FAILURES=0
 
 usage() { sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; }
+# Mask --api-key values in text we print (#70). Any whitespace or "=" may separate flag and value.
+redact_secrets() {
+  local s="$1" tail="" re='^(.*--api-key[=[:space:]]+)[^[:space:]]+(.*)$'
+  while [[ $s =~ $re ]]; do tail="***${BASH_REMATCH[2]}$tail"; s="${BASH_REMATCH[1]}"; done
+  printf '%s' "$s$tail"
+}
 
 # A profile is a plain KEY=VALUE env file. One comment line carries metadata:
 #   # desc: one line shown by `flash profiles`
@@ -300,8 +306,8 @@ cmd_serve() {
   printf '%s  MODE=%s IMAGE=%s NAME=%s PORT=%s CTX=%s YARN=%s MTP=%s SEQS=%s GPU_MEM=%s KV_DTYPE=%s%s\n' "$c_dim" "$MODE" "$IMAGE" "$NAME" "$PORT" "${CTX:-262144}" "${YARN:-0}" "${MTP:-2}" "${SEQS:-8}" "$GPU_MEM" "$KV_DTYPE" "$c_off"
   [ -n "${DRAFT_MODEL:-}" ] && printf '%s  DRAFT_MODEL=%s DRAFT_TOKENS=%s%s\n' "$c_dim" "$DRAFT_MODEL" "${DRAFT_TOKENS:-4}" "$c_off" || true
   [ -n "${CPUSET:-}${MAMBA_SSM_DTYPE:-}" ] && printf '%s  CPUSET=%s MAMBA_SSM_DTYPE=%s%s\n' "$c_dim" "${CPUSET:--}" "${MAMBA_SSM_DTYPE:--}" "$c_off" || true
-  [ -n "${DOCKER_EXTRA:-}" ] && printf '%s  DOCKER_EXTRA=%s%s\n' "$c_dim" "$DOCKER_EXTRA" "$c_off" || true
-  [ -n "${EXTRA:-}" ] && printf '%s  EXTRA=%s%s\n' "$c_dim" "$EXTRA" "$c_off" || true
+  [ -n "${DOCKER_EXTRA:-}" ] && printf '%s  DOCKER_EXTRA=%s%s\n' "$c_dim" "$(redact_secrets "$DOCKER_EXTRA")" "$c_off" || true
+  [ -n "${EXTRA:-}" ] && printf '%s  EXTRA=%s%s\n' "$c_dim" "$(redact_secrets "$EXTRA")" "$c_off" || true
   have_image || die "$IMAGE is not built — run: ./flash setup $profile"
   if [ -n "$DRAFT_MODEL" ] && ! image_has_dflash; then
     die "$IMAGE lacks DFlash support (patch 23), even if its base is $BASE_EXPECTED — rebuild: ./flash setup $profile"
@@ -314,7 +320,7 @@ cmd_serve() {
   local b; b="$(image_base)"
   [ "$b" != "$BASE_EXPECTED" ] && die "$IMAGE is an old '${b:-unlabeled}' build, this recipe needs the $BASE_EXPECTED base — run: ./flash setup $profile"
   if [ "$(container_state)" = running ]; then info "$NAME is running and will be replaced"; fi
-  if [ "$DRY" = 1 ]; then info "dry run: would exec scripts/serve.sh with the environment above"; env | grep -E '^(MODE|IMAGE|NAME|SERVED_MODEL_NAME|PORT|CTX|YARN|MTP|DRAFT_MODEL|DRAFT_TOKENS|SEQS|CPUSET|MAMBA_SSM_DTYPE|GPU_MEM|KV_DTYPE|PREFIX_CACHE|DET_TOPK|EXACT_TOPK|DRAFT_VOCAB|MADVISE|FAST_ROWS|EFFORT_ALIAS|PREWARM|COMPILE_CACHE|EXTRA|DOCKER_EXTRA|LOG_REQUESTS|WORKERS)=' | sort | sed 's/^/    /'; return 0; fi
+  if [ "$DRY" = 1 ]; then info "dry run: would exec scripts/serve.sh with the environment above"; redact_secrets "$(env)" | grep -E '^(MODE|IMAGE|NAME|SERVED_MODEL_NAME|PORT|CTX|YARN|MTP|DRAFT_MODEL|DRAFT_TOKENS|SEQS|CPUSET|MAMBA_SSM_DTYPE|GPU_MEM|KV_DTYPE|PREFIX_CACHE|DET_TOPK|EXACT_TOPK|DRAFT_VOCAB|MADVISE|FAST_ROWS|EFFORT_ALIAS|PREWARM|COMPILE_CACHE|EXTRA|DOCKER_EXTRA|LOG_REQUESTS|WORKERS)=' | sort | sed 's/^/    /'; return 0; fi
   remember_profile "$profile"
   exec "$HERE/scripts/serve.sh"
 }

@@ -39,6 +39,8 @@ run()  { if [ "$DRY" = 1 ]; then printf '  %s$ %s%s\n' "$c_dim" "$*" "$c_off"; e
 WARNINGS=0; FAILURES=0
 
 usage() { sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; }
+# Mask secret values (currently --api-key X / --api-key=X) before echoing user flags.
+redact_secrets() { printf '%s' "$1" | sed -E 's/(--api-key)([= ])[^ ]+/\1\2***/g'; }
 
 # A profile is a plain KEY=VALUE env file. One comment line carries metadata:
 #   # desc: one line shown by `flash profiles`
@@ -300,8 +302,8 @@ cmd_serve() {
   printf '%s  MODE=%s IMAGE=%s NAME=%s PORT=%s CTX=%s YARN=%s MTP=%s SEQS=%s GPU_MEM=%s KV_DTYPE=%s%s\n' "$c_dim" "$MODE" "$IMAGE" "$NAME" "$PORT" "${CTX:-262144}" "${YARN:-0}" "${MTP:-2}" "${SEQS:-8}" "$GPU_MEM" "$KV_DTYPE" "$c_off"
   [ -n "${DRAFT_MODEL:-}" ] && printf '%s  DRAFT_MODEL=%s DRAFT_TOKENS=%s%s\n' "$c_dim" "$DRAFT_MODEL" "${DRAFT_TOKENS:-4}" "$c_off" || true
   [ -n "${CPUSET:-}${MAMBA_SSM_DTYPE:-}" ] && printf '%s  CPUSET=%s MAMBA_SSM_DTYPE=%s%s\n' "$c_dim" "${CPUSET:--}" "${MAMBA_SSM_DTYPE:--}" "$c_off" || true
-  [ -n "${DOCKER_EXTRA:-}" ] && printf '%s  DOCKER_EXTRA=%s%s\n' "$c_dim" "$DOCKER_EXTRA" "$c_off" || true
-  [ -n "${EXTRA:-}" ] && printf '%s  EXTRA=%s%s\n' "$c_dim" "$EXTRA" "$c_off" || true
+  [ -n "${DOCKER_EXTRA:-}" ] && printf '%s  DOCKER_EXTRA=%s%s\n' "$c_dim" "$(redact_secrets "$DOCKER_EXTRA")" "$c_off" || true
+  [ -n "${EXTRA:-}" ] && printf '%s  EXTRA=%s%s\n' "$c_dim" "$(redact_secrets "$EXTRA")" "$c_off" || true
   have_image || die "$IMAGE is not built — run: ./flash setup $profile"
   if [ -n "$DRAFT_MODEL" ] && ! image_has_dflash; then
     die "$IMAGE lacks DFlash support (patch 23), even if its base is $BASE_EXPECTED — rebuild: ./flash setup $profile"

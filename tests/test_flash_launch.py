@@ -102,6 +102,25 @@ else:
         self.assertIn("DOCKER_EXTRA=-e PRESENT=1", r.stdout)
         self.assertFalse(any(x[0] in ("rm", "run") for x in self.calls()))
 
+    def test_serve_output_redacts_api_key(self):
+        # #70: printed EXTRA / DOCKER_EXTRA must not leak --api-key, in normal and DRY runs,
+        # whatever whitespace separates the flag from its value; docker still gets the real key.
+        extra = "--api-key\tsk-TAB --max-num-seqs 2 --api-key=sk-EQ"
+        docker_extra = "-e PRESENT=1 --api-key   sk-SPACES"
+        for dry in ("0", "1"):
+            with self.subTest(dry=dry):
+                r = self.run_script("flash", "serve", "default", "EXTRA=" + extra,
+                                    "DOCKER_EXTRA=" + docker_extra, DRY=dry)
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                out = r.stdout + r.stderr
+                for secret in ("sk-TAB", "sk-EQ", "sk-SPACES"):
+                    self.assertNotIn(secret, out)
+                self.assertIn("--max-num-seqs 2", out)
+                self.assertIn("PRESENT=1", out)
+        args = next(x for x in self.calls() if x[0] == "run")
+        self.assertIn("sk-TAB", args)
+        self.assertIn("--api-key=sk-EQ", args)
+
     def test_direct_serve_no_shell_or_glob_expansion(self):
         (self.root / "glob-match").touch()
         r = self.run_script("scripts/serve.sh", MODE="nvfp4", DRAFT_MODEL="",

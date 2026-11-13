@@ -1,0 +1,13 @@
+>> health
+   OK
+>> model: qwen3.8-flash-next
+>> coherence
+   ' Paris. The capital of Germany is Berlin. The capital of'
+>> reasoning_effort high (Claude Code's default) on /v1/messages
+   OK
+>> prefill (TTFT on a ~8k-token prompt), then determinism + prefix-cache hit on the same prompt
+   10665 tok in 5.28s  =>  2020 tok/s prefill (cold)
+   same prompt again: 0.37s  =>  prefix-cache HIT (hits 0 -> 9984)
+   first-token logprobs identical across runs: NO (stock top-k kernel? DET_TOPK=0 EXACT_TOPK=0)
+>> decode (real answer, greedy — never use ignore_eos with this model)
+   400 tok in 10.60s  =>  37.7 tok/s end-to-end (includes TTFT; steady-state decode is higher, see README)

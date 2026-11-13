@@ -1,0 +1,19 @@
+pgx04 startup deviation, 2026-11-11
+
+The existing system-level model service was not discovered before the first
+manual container switch. The v0.32 baseline finished before this incident.
+Stopping the old production container triggered the service's restart policy.
+The service startup script was pinned to image v0.32, removed the first v0.33
+container while it was loading, and failed because the updated recipe rejected
+the old image base. This was visible as a Docker kill/destroy, not an engine OOM.
+Its existing startup memory hook also dropped clean filesystem cache.
+
+The system service was explicitly stopped. Its startup script was updated to
+image v0.33 and the mtp-fast profile, with adoption of an already validated
+running container during service handover. The new container was then started
+again. The measured after arm follows the successful retry and API smoke checks.
+
+The originally recorded protocol did not plan a cache drop. This is an explicit
+deviation: the baseline was a long-running production server, whereas the new
+arm starts after a cache drop and model reload. No memory/cache matching or
+isolated vLLM-version speedup is claimed. Swapping was not explicitly reset.

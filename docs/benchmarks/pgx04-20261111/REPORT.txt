@@ -41,9 +41,10 @@ The concurrent cell shares a prompt and measures warm/shared-prefix output,
 not unique-context capacity. The fixed-time client can collect unequal counts.
 
 Completion limits:
-Before: 16 recorded single-request samples; 12 reached the output cap.
+Before: 16 recorded single-request samples; 12 ended with finish_reason=length.
 Before: repeated greedy text identical in 8/8 fresh/repeat pairs.
-After: 16 recorded single-request samples; 11 reached the output cap.
+After: 16 recorded single-request samples; 11 ended with finish_reason=length.
+After: 12 samples contained 256 completion tokens; one ended with finish_reason=stop.
 After: repeated greedy text identical in 0/8 fresh/repeat pairs.
 
 Limits: one measured server lifetime per arm, sequential order. Baseline
@@ -64,8 +65,11 @@ incident, not a measured model failure. See startup-incident.txt.
 Validation: see smoke-after.txt and api-checks-after.json. This report
 contains no HumanEval, long-context quality or multimodal quality claim.
 The upstream smoke test reports non-identical first-token logprobs on the
-new profile. Repeated greedy text differences are retained above; bitwise
-determinism is not established. The cause was not isolated by this short run.
+new profile. Its banner shows DET_TOPK=0, while environment-after.json records
+VLLM_QSA_DET_TOPK=1 for the server. The banner alone therefore does not
+establish the server's effective top-k mode. Repeated greedy text differences
+are retained above; bitwise determinism is not established. The cause was not
+isolated by this short run.
 
 Reproduce on each idle serving arm:
 python3 bench_serving-integrity.py --seconds 180 --seed 4111 --label ARM --output NEW.jsonl

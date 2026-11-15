@@ -47,6 +47,7 @@ shared network, use an authenticated gateway or set vLLM's `--api-key`. See
 | More shared KV capacity at 1M | `mtp4-1m` |
 | Shorter interruptions to active streams during long prefills | `shared` |
 | Previous MTP2 recipe, with reduced draft vocabulary | `mtp-standard` |
+| Opt-in prefix-cache checkpoint workaround at native 262k context | `prefix-cache-safe` |
 
 ```bash
 ./flash profiles
@@ -127,6 +128,7 @@ With `published`, lower `CTX` if the engine reports a smaller KV ceiling.
 
 | Date | Change |
 | --- | --- |
+| 2026-11-15 | **Opt-in prefix-cache checkpoint workaround for vLLM 0.33.** [Configuration, cache-hit checks and validation limits](docs/PREFIX-CACHE-WORKAROUND.md). |
 | 2026-11-04 | **vLLM 0.33 and `mtp-fast` by default.** [Upgrade and measurements](#vllm-v033-upgrade). |
 | 2026-11-04 | **1M-context profiles.** `dflash-1m` and `mtp4-1m` passed retrieval at 990k. [Results and profile choice](#choosing-a-1m-context-profile). |
 
@@ -134,6 +136,7 @@ With `published`, lower `CTX` if the engine reports a smaller KV ceiling.
 
 - [Serving reference](docs/SERVING.md) for the full profile list, tuning, TLS, diagnostics and benchmarks.
 - [vLLM 0.33](docs/VLLM-033.md) for upgrade details and measured workloads.
+- [Prefix-cache checkpoint workaround](docs/PREFIX-CACHE-WORKAROUND.md) for activation, fresh/cache-hit probes and validation limits.
 - [GB10 0.31 to 0.33 comparison](docs/GB10-031-033-20261110.md) for paired
   deployment results and raw data.
 - [How it works](docs/HOW-IT-WORKS.md) for PLE offload, hybrid weights and GB10 patches.

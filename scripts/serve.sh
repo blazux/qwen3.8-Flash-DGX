@@ -15,10 +15,11 @@
 #                     hybrid-mtp = hybrid with the MTP draft experts in NVFP4 (grafted from
 #                     Inferact's checkpoint): ~3.4 GB less on the card, ~4x fewer bytes read
 #                     per draft step. Needs scripts/prepare-mtp-graft.sh
-#   PREFIX_CACHE=1    1 = --enable-prefix-caching (correct with this image's block_size fix;
-#                     repeated prefixes — system prompts, multi-turn, tool loops — skip the prefill)
-#   DET_TOPK=1        1 = deterministic QSA top-k KERNEL (@jschmied, vllm#55122): identical output at
-#                     temperature 0 at no prefill cost. The default.
+#   PREFIX_CACHE=1    1 = --enable-prefix-caching; repeated prefixes skip the prefill.
+#   SPLIT_PREFILL=0   1 = opt-in v0.33 checkpoint-boundary workaround; requires a patched image.
+#                     See docs/PREFIX-CACHE-WORKAROUND.md for evidence and limits.
+#   DET_TOPK=1        1 = deterministic QSA top-k KERNEL (@jschmied, vllm#55122) at full kernel speed.
+#                     The default; this alone does not guarantee identical results with prefix reuse.
 #   EXACT_TOPK=0      1 = exact torch.topk fallback (also deterministic, but -20-40% long prefill); wins over DET_TOPK
 #   DRAFT_VOCAB=1     1 = the MTP drafter scores only the 65,536 most frequent tokens (+20% decode, same
 #                     tournament score); 0 = full vocabulary; a path = your own ids.npy (tools/build_draft_vocab.py).
@@ -116,6 +117,11 @@ read -r -a DOCKER_ARGS <<< "${DOCKER_EXTRA//$'\n'/ }"
 
 SERVE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$SERVE_ROOT/scripts/image-capabilities.sh"
+require_split_prefill || exit 1
+SPLIT_ENV=()
+if [ "${SPLIT_PREFILL:-0}" = 1 ]; then
+  SPLIT_ENV=(-e VLLM_DGX_SPLIT_PREFILL=1)
+fi
 if [ -n "$DRAFT_MODEL" ] && ! image_has_dflash; then
   echo "!! $IMAGE lacks DFlash support (patch 23) — run ./flash setup dflash or rebuild this image from the current Dockerfile."
   exit 1
@@ -421,7 +427,7 @@ docker run -d --name "$NAME" --restart unless-stopped \
   -e VLLM_QSA_EXACT_TOPK="$EXACT_TOPK" "${DETENV[@]}" \
   -e VLLM_USE_FLASHINFER_SAMPLER=1 -e VLLM_ALLOW_LONG_MAX_MODEL_LEN="$ALLOW_LONG" \
   "${HYBRID_ENV[@]}" "${DRAFT_ENV[@]}" \
-  "${DOCKER_ARGS[@]}" \
+  "${DOCKER_ARGS[@]}" "${SPLIT_ENV[@]}" \
   "$IMAGE" \
   "$SNAP_IN" --served-model-name "$SERVED_MODEL_NAME" \
     --host 0.0.0.0 --port 8000 --load-format safetensors \
@@ -450,6 +456,6 @@ case "$STATE" in
     ;;
 esac
 
-echo ">> $NAME starting on :$PORT (model '$SERVED_MODEL_NAME', mode=$MODE, ctx $CTX, yarn=$YARN, mtp=$MTP${DRAFT_MODEL:+, draft_model=$DRAFT_MODEL tokens=$DRAFT_TOKENS}, seqs=$SEQS, prefix_cache=$PREFIX_CACHE, det_topk=$DET_TOPK, exact_topk=$EXACT_TOPK, draft_vocab=$DRAFT_VOCAB, madvise=$MADVISE, fast_rows=$FAST_ROWS, effort_alias=$EFFORT_ALIAS_STATE${CPUSET:+, cpuset=$CPUSET}${MAMBA_SSM_DTYPE:+, ssm_dtype=$MAMBA_SSM_DTYPE}${COMPILE_CACHE:+, compile_cache=$COMPILE_CACHE})"
+echo ">> $NAME starting on :$PORT (model '$SERVED_MODEL_NAME', mode=$MODE, ctx $CTX, yarn=$YARN, mtp=$MTP${DRAFT_MODEL:+, draft_model=$DRAFT_MODEL tokens=$DRAFT_TOKENS}, seqs=$SEQS, prefix_cache=$PREFIX_CACHE, split_prefill=${SPLIT_PREFILL:-0}, det_topk=$DET_TOPK, exact_topk=$EXACT_TOPK, draft_vocab=$DRAFT_VOCAB, madvise=$MADVISE, fast_rows=$FAST_ROWS, effort_alias=$EFFORT_ALIAS_STATE${CPUSET:+, cpuset=$CPUSET}${MAMBA_SSM_DTYPE:+, ssm_dtype=$MAMBA_SSM_DTYPE}${COMPILE_CACHE:+, compile_cache=$COMPILE_CACHE})"
 echo ">> first boot loads ~75 GiB of weights (~3-4 min). Follow:  docker logs -f $NAME"
 echo ">> ready when the log says 'Application startup complete'. Then: scripts/smoke-test.sh"

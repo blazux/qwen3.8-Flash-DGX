@@ -224,6 +224,10 @@ cmd_doctor() {
     fi
   else info "$IMAGE not built yet — ./flash setup $profile will (a few minutes, plus the pull)"; fi
 
+  if [ "$docker_ok" = 1 ] && have_image && ! require_split_prefill; then
+    fail "prefix-boundary capability check failed"
+  fi
+
   step "weights ($MODEL in $HF_CACHE)"
   mkdir -p "$HF_CACHE" 2>/dev/null || true
   if [ -d "$HF_CACHE" ] && [ ! -w "$HF_CACHE" ]; then warn "$HF_CACHE is not writable by you (owner: $(stat -c %U "$HF_CACHE" 2>/dev/null)), typically a cache first created by a manual 'docker run -v'. Downloads still work (the container runs as root); serve.sh keeps its chat-template copy elsewhere. To own it: sudo chown -R \$USER $HF_CACHE"; fi
@@ -266,11 +270,13 @@ cmd_doctor() {
 cmd_setup() {
   local profile="${1:-default}"; shift || true
   need_profile "$profile"; load_profile "$PROFILE_FILE" "$@"
+  validate_split_prefill || exit 1
   echo "setup — profile '$profile' (image $IMAGE, mode $MODE). Every step is skipped when already done."
 
   step "1/4 image $IMAGE"
   if have_image && [ "$(image_base)" = "$BASE_EXPECTED" ] \
-     && { [ -z "$DRAFT_MODEL" ] || image_has_dflash; }; then ok "already built (base $BASE_EXPECTED, required capabilities present)"; else
+     && { [ -z "$DRAFT_MODEL" ] || image_has_dflash; } \
+     && require_split_prefill; then ok "already built (base $BASE_EXPECTED, required capabilities present)"; else
     [ -f "$HERE/Dockerfile" ] || die "Dockerfile not found in $HERE"
     run docker build -t "$IMAGE" "$HERE"; ok "built"; fi
 
@@ -312,6 +318,7 @@ cmd_serve() {
   if [ -n "$DRAFT_MODEL" ] && ! image_has_dflash; then
     die "$IMAGE lacks DFlash support (patch 23), even if its base is $BASE_EXPECTED — rebuild: ./flash setup $profile"
   fi
+  require_split_prefill || exit 1
   have_weights || die "weights not downloaded — run: ./flash setup $profile"
   case "$MODE" in hybrid|hybrid-mtp) have_hybrid || die "hybrid checkpoint not prepared — run: ./flash setup $profile"
     local stale; stale="$(hybrid_stale)"; [ -z "$stale" ] || die "hybrid layout is missing $stale (prepared from an incomplete download, issue #17) — run scripts/prepare-hybrid.sh again, it repairs it" ;; esac
@@ -320,7 +327,7 @@ cmd_serve() {
   local b; b="$(image_base)"
   [ "$b" != "$BASE_EXPECTED" ] && die "$IMAGE is an old '${b:-unlabeled}' build, this recipe needs the $BASE_EXPECTED base — run: ./flash setup $profile"
   if [ "$(container_state)" = running ]; then info "$NAME is running and will be replaced"; fi
-  if [ "$DRY" = 1 ]; then info "dry run: would exec scripts/serve.sh with the environment above"; redact_secrets "$(env)" | grep -E '^(MODE|IMAGE|NAME|SERVED_MODEL_NAME|PORT|CTX|YARN|MTP|DRAFT_MODEL|DRAFT_TOKENS|SEQS|CPUSET|MAMBA_SSM_DTYPE|GPU_MEM|KV_DTYPE|PREFIX_CACHE|DET_TOPK|EXACT_TOPK|DRAFT_VOCAB|MADVISE|FAST_ROWS|EFFORT_ALIAS|PREWARM|COMPILE_CACHE|EXTRA|DOCKER_EXTRA|LOG_REQUESTS|WORKERS)=' | sort | sed 's/^/    /'; return 0; fi
+  if [ "$DRY" = 1 ]; then info "dry run: would exec scripts/serve.sh with the environment above"; redact_secrets "$(env)" | grep -E '^(MODE|IMAGE|NAME|SERVED_MODEL_NAME|PORT|CTX|YARN|MTP|DRAFT_MODEL|DRAFT_TOKENS|SEQS|CPUSET|MAMBA_SSM_DTYPE|GPU_MEM|KV_DTYPE|PREFIX_CACHE|SPLIT_PREFILL|DET_TOPK|EXACT_TOPK|DRAFT_VOCAB|MADVISE|FAST_ROWS|EFFORT_ALIAS|PREWARM|COMPILE_CACHE|EXTRA|DOCKER_EXTRA|LOG_REQUESTS|WORKERS)=' | sort | sed 's/^/    /'; return 0; fi
   remember_profile "$profile"
   exec "$HERE/scripts/serve.sh"
 }

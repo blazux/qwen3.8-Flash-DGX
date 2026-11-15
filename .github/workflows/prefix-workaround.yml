@@ -1,0 +1,22 @@
+name: Prefix workaround safeguards
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  cpu-regressions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Check source guard, probe and launcher without a GPU
+        run: |
+          python3 tests/test_prefix_cache_patch.py
+          python3 tests/test_prefix_cache_probe.py
+          python3 tests/test_flash_launch.py

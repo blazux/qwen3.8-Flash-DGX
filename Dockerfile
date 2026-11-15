@@ -128,3 +128,10 @@ COPY src/patches/qwen-parser-v033.patch /tmp/qwen-parser-v033.patch
 RUN cd ${SP} && patch --batch --forward --fuzz=0 -p1 < /tmp/qwen-parser-v033.patch \
  && python3 -c "import ast, jsonschema, referencing; ast.parse(open('${SP}/vllm/parser/engine/argument_validation.py').read())" \
  && rm /tmp/qwen-parser-v033.patch
+
+# --- 24. Opt-in boundary-split prefix reuse (v0.33 only) ---
+# Hash guard rejects upstream drift. Inert unless VLLM_DGX_SPLIT_PREFILL=1.
+# Kept last so the existing recipe's cached build layers can be reused.
+COPY src/prefix_cache_boundaries/ /opt/dgx-prefix-boundaries/
+RUN python3 /opt/dgx-prefix-boundaries/apply_patch.py ${SP}/vllm/model_executor/layers/mamba/abstract.py
+LABEL dgx.prefix-boundaries="opt-in-v1"

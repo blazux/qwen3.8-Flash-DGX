@@ -1,0 +1,20 @@
+--- a/vllm/model_executor/layers/mamba/abstract.py
++++ b/vllm/model_executor/layers/mamba/abstract.py
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import os
+ from abc import abstractmethod
+ from collections.abc import Iterable
+ from math import lcm, prod
+@@ -101,6 +102,10 @@
+     None unless every Mamba layer declares one: the scheduler takes internal
+     checkpoints only when every Mamba group can export them.
+     """
++    # Local diagnostic opt-out: use ordinary boundary-split prefills in every
++    # Mamba group, keeping scheduler, allocation, and checkpoint export in sync.
++    if os.environ.get("VLLM_DGX_SPLIT_PREFILL") == "1":
++        return None
+     alignment = 1
+     for layer in get_layers_from_vllm_config(
+         vllm_config,

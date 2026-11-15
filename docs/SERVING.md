@@ -15,6 +15,7 @@ Start with the [README](../README.md) for installation and profile selection.
 | `shared` | `mtp-standard` with a 1,024-token long-prefill threshold | Shorter pauses in ongoing streams at the cost of a slower concurrent prefill. |
 | `published` | NVIDIA NVFP4 checkpoint as published, YaRN 500k | No hybrid conversion. Automatic KV sizing can be tight at 500k. |
 | `native` | hybrid, 262k, no YaRN | if you never go past the native context |
+| `prefix-cache-safe` | hybrid, native 262k, MTP3, BF16 recurrent state, 13 GiB FP8 KV, boundary-split prefills | Opt-in [prefix-cache checkpoint workaround](PREFIX-CACHE-WORKAROUND.md); see the guide for measured scope and 500k/YaRN overrides. |
 
 The earlier MTP recipes remain available for existing commands.
 
@@ -41,8 +42,9 @@ profiles set their own values as shown above.
 | Var | Default | Notes |
 | --- | --- | --- |
 | `MODE` | `nvfp4` | `hybrid` = fp8 side layers (see above; needs `scripts/prepare-hybrid.sh`). |
-| `PREFIX_CACHE` | `1` | `--enable-prefix-caching`. Correct with this image (block_size fix). |
-| `DET_TOPK` | `1` | Deterministic QSA top-k **kernel** (vllm#55122): identical outputs at T=0 at full kernel speed. `0` = stock kernel (non-deterministic, may drop attention candidates, issue #3). |
+| `PREFIX_CACHE` | `1` | `--enable-prefix-caching`. Reuses saved prefixes. For fresh/cache-hit differences reported on vLLM 0.33, see the [checkpoint workaround](PREFIX-CACHE-WORKAROUND.md). |
+| `SPLIT_PREFILL` | `0` | `1` selects the existing boundary-split prefill path instead of internal recurrent-state checkpoints. Requires the guarded patch and image capability; prefix reuse remains enabled. See the [workaround guide](PREFIX-CACHE-WORKAROUND.md). |
+| `DET_TOPK` | `1` | Deterministic QSA top-k **kernel** (vllm#55122) at full kernel speed. This flag alone does not guarantee identical end-to-end results with cache reuse. `0` = stock kernel (non-deterministic, may drop attention candidates, issue #3). |
 | `EXACT_TOPK` | `0` | `1` = exact `torch.topk` fallback (deterministic; −8% prefill at 8k, −20–40% at 32k+). Wins over `DET_TOPK` when set. |
 | `DRAFT_VOCAB` | `1` | MTP drafter scores only the 65,536 most frequent tokens (+20% decode, same tournament score, outputs unchanged). `0` = full vocabulary; a path = your own ids (`tools/build_draft_vocab.py`). MTP-head only — ignored for a `DRAFT_MODEL` (dflash) draft, which requires the full verifier vocabulary. |
 | `MADVISE` | `random` | `madvise` on the mmapped PLE table: `random` (no readahead: cold prefill −4–8%, cleaner page cache) or `normal`. |

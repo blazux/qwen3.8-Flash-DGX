@@ -1,0 +1,8 @@
+{
+  "original_sha256": "08506d9dc3e1a58d42a72cb80c81e32a51d4bda7f7be2551d355db19a0d02f9d",
+  "patched_sha256": "bfd0a08d627ac0dc6604425f89474328abb71b43e79c67047673cdff858e0bae",
+  "purpose": "Opt-in workaround: disable internal prefill checkpoints consistently across layers, scheduler, and cache manager while retaining normal prefix reuse and FlashInfer.",
+  "target": "vllm/model_executor/layers/mamba/abstract.py",
+  "vllm_version": "0.33.0",
+  "upstream_recipe_commit": "97dee1665bbb024b268e1b4f585605095ff7e0d2"
+}

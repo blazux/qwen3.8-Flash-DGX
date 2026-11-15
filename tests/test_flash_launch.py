@@ -19,6 +19,8 @@ class LaunchTest(unittest.TestCase):
         self.log = self.root / "docker.jsonl"
         self.cap = self.root / "capability"
         self.cap.write_text("1")
+        self.split_cap = self.root / "split-capability"
+        self.split_cap.write_text("opt-in-v1")
         self.bin = self.root / "bin"
         self.bin.mkdir()
         docker = self.bin / "docker"
@@ -31,9 +33,12 @@ with open(os.environ["FAKE_DOCKER_LOG"], "a") as f:
 cap = Path(os.environ["FAKE_CAP"])
 if args[:2] == ["image", "inspect"]:
     if "-f" in args:
-        print(cap.read_text() if "qwen38.dflash" in args[args.index("-f") + 1] else "v0.33")
+        label = args[args.index("-f") + 1]
+        print(Path(os.environ["FAKE_SPLIT_CAP"]).read_text() if "dgx.prefix-boundaries" in label
+              else cap.read_text() if "qwen38.dflash" in label else "v0.33")
 elif args[0] == "build":
     cap.write_text("1")
+    Path(os.environ["FAKE_SPLIT_CAP"]).write_text("opt-in-v1")
 elif args[0] == "inspect":
     print("running exit=0 oom=false" if "exit=" in args[2] else "running")
 elif args[0] == "info":
@@ -74,6 +79,7 @@ else:
                          "HF_CACHE": str(self.cache), "IMAGE": "test-image",
                          "XDG_STATE_HOME": str(self.root / "state"),
                          "FAKE_DOCKER_LOG": str(self.log), "FAKE_CAP": str(self.cap),
+                         "FAKE_SPLIT_CAP": str(self.split_cap),
                          "EFFORT_ALIAS": "0", "DRY": "0"})
 
     def run_script(self, script, *args, **env):
@@ -189,6 +195,69 @@ else:
         r = self.run_script("flash", "doctor", "dflash")
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("lacks the DFlash capability label", r.stdout)
+
+    def test_prefix_profile_preserves_workaround_settings(self):
+        r = self.run_script("flash", "serve", "prefix-cache-safe")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        args = next(x for x in self.calls() if x[0] == "run")
+        self.assertIn("VLLM_DGX_SPLIT_PREFILL=1", args[:args.index("test-image")])
+        self.assertIn("--enable-prefix-caching", args)
+        self.assertEqual(args[args.index("-p") + 1], "127.0.0.1:18300:8000")
+        self.assertEqual(args[args.index("--max-model-len") + 1], "262144")
+        self.assertEqual(args[args.index("--kv-cache-memory-bytes") + 1], "13958643712")
+        self.assertNotIn("--rope-scaling", args)
+        self.assertEqual(json.loads(args[args.index("--speculative-config") + 1])["num_speculative_tokens"], 3)
+
+    def test_prefix_profile_passes_explicit_500k_yarn_overrides(self):
+        r = self.run_script("flash", "serve", "prefix-cache-safe", "CTX=500000", "YARN=1")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        args = next(x for x in self.calls() if x[0] == "run")
+        self.assertIn("VLLM_DGX_SPLIT_PREFILL=1", args[:args.index("test-image")])
+        self.assertIn("--enable-prefix-caching", args)
+        self.assertEqual(args[args.index("--max-model-len") + 1], "500000")
+        self.assertEqual(json.loads(args[args.index("--speculative-config") + 1])["max_model_len"], 500000)
+        rope = json.loads(args[args.index("--hf-overrides") + 1])["text_config"]["rope_parameters"]
+        self.assertEqual(rope["rope_type"], "yarn")
+        self.assertEqual(rope["factor"], 4.0)
+        self.assertEqual(rope["original_max_position_embeddings"], 262144)
+
+    def test_missing_prefix_patch_blocks_launch_before_container_removal(self):
+        self.split_cap.write_text("")
+        for script, args in [("flash", ("serve", "prefix-cache-safe")), ("scripts/serve.sh", ())]:
+            with self.subTest(script=script):
+                r = self.run_script(script, *args, SPLIT_PREFILL="1")
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn("lacks the prefix-boundary workaround", r.stdout + r.stderr)
+        self.assertFalse(any(x[0] in ("rm", "run") for x in self.calls()))
+
+    def test_prefix_setup_rebuilds_image_missing_patch_once(self):
+        self.split_cap.write_text("")
+        for _ in range(2):
+            r = self.run_script("flash", "setup", "prefix-cache-safe")
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(sum(x[0] == "build" for x in self.calls()), 1)
+        self.assertFalse(any(x[0] in ("rm", "run") for x in self.calls()))
+
+    def test_default_does_not_enable_split_prefill(self):
+        self.split_cap.write_text("")
+        r = self.run_script("flash", "serve", "default")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        args = next(x for x in self.calls() if x[0] == "run")
+        self.assertFalse(any(a.startswith("VLLM_DGX_SPLIT_PREFILL=") for a in args))
+
+    def test_invalid_split_setting_stops_before_removal(self):
+        r = self.run_script("flash", "serve", "prefix-cache-safe", SPLIT_PREFILL="yes")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("SPLIT_PREFILL must be 0 or 1", r.stdout + r.stderr)
+        self.assertFalse(any(x[0] in ("rm", "run") for x in self.calls()))
+
+    def test_invalid_split_setting_stops_setup_before_build(self):
+        for value in ("yes", "2"):
+            with self.subTest(value=value):
+                r = self.run_script("flash", "setup", "prefix-cache-safe", "SPLIT_PREFILL=" + value)
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn("SPLIT_PREFILL must be 0 or 1", r.stdout + r.stderr)
+                self.assertFalse(any(x[0] in ("build", "rm", "run") for x in self.calls()))
 
 
 if __name__ == "__main__":
